@@ -35,6 +35,13 @@ android {
     buildFeatures {
         compose = true
     }
+    packaging {
+        jniLibs {
+            // This forces the .so libraries to be extracted to disk,
+            // bypassing the 16KB alignment requirement.
+            useLegacyPackaging = true
+        }
+    }
 }
 
 dependencies {
@@ -53,5 +60,5 @@ dependencies {
     androidTestImplementation(libs.androidx.compose.ui.test.junit4)
     debugImplementation(libs.androidx.compose.ui.tooling)
     debugImplementation(libs.androidx.compose.ui.test.manifest)
-    implementation("com.microsoft.onnxruntime:onnxruntime-android:1.16.0")
+    implementation("com.microsoft.onnxruntime:onnxruntime-android:1.19.0")
 }
