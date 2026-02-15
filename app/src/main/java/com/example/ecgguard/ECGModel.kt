@@ -5,56 +5,47 @@ import ai.onnxruntime.OnnxTensor
 import ai.onnxruntime.OrtEnvironment
 import java.nio.FloatBuffer
 import java.util.Collections
-import kotlin.math.sqrt
 
 class ECGModel(context: Context) {
     // 1. Initialize ONNX Environment
     private val env = OrtEnvironment.getEnvironment()
 
     // 2. Load the Model from Assets
-    // Note: If this crashes, ensure the filename 'ecg_model.onnx' matches exactly what is in your assets folder
-    private val session = env.createSession(context.assets.open("ecg_model_final.onnx").readBytes())
+    private val session = env.createSession(context.assets.open("LSTM_NSR_autoencoder_10s.onnx").readBytes())
 
-    fun calculateMSE(window: FloatArray): Float {
-        // --- Z-Score Normalization ---
-        // Crucial: Makes the model independent of hardware gain/voltage differences
-        val mean = window.average().toFloat()
-        val variance = window.fold(0.0f) { acc, v -> acc + (v - mean) * (v - mean) } / window.size
-        val std = sqrt(variance)
+    // Returns a Pair containing:
+    // First: The calculated MSE (Float)
+    // Second: The reconstructed signal (FloatArray)
+    fun runInference(window: FloatArray): Pair<Float, FloatArray> {
 
-        // Normalize (checking for division by zero)
-        val normWindow = if (std > 1e-6) {
-            FloatArray(window.size) { (window[it] - mean) / std }
-        } else {
-            window
-        }
-
-        // --- Prepare Input Tensor ---
+        // --- 1. Prepare Input Tensor ---
+        // The 'window' array is already mean-centered by MainActivity
         // Shape: [Batch=1, Seq=2500, Features=1]
         val shape = longArrayOf(1, 2500, 1)
-        val tensor = OnnxTensor.createTensor(env, FloatBuffer.wrap(normWindow), shape)
+        val tensor = OnnxTensor.createTensor(env, FloatBuffer.wrap(window), shape)
 
-        // --- Run Inference ---
+        // --- 2. Run Inference ---
         val inputName = session.inputNames.iterator().next()
         val result = session.run(Collections.singletonMap(inputName, tensor))
 
-        // --- Extract Output ---
+        // --- 3. Extract Output ---
         val outputTensor = result[0] as OnnxTensor
         val outputBuffer = outputTensor.floatBuffer
         val reconstruction = FloatArray(2500)
         outputBuffer.get(reconstruction)
 
-        // --- Calculate MSE (Reconstruction Error) ---
-        var mse = 0.0f
-        for (i in normWindow.indices) {
-            val err = normWindow[i] - reconstruction[i]
-            mse += err * err
+        // --- 4. Calculate MSE (Reconstruction Error) ---
+        var mseSum = 0.0f
+        for (i in window.indices) {
+            val err = window[i] - reconstruction[i]
+            mseSum += err * err
         }
+        val mse = mseSum / 2500f
 
-        // Close resources to prevent memory leaks
+        // --- 5. Close resources to prevent memory leaks ---
         result.close()
         tensor.close()
 
-        return mse / 2500
+        return Pair(mse, reconstruction)
     }
 }
