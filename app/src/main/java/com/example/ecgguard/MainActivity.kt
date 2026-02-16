@@ -7,15 +7,23 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -36,22 +44,27 @@ class MainActivity : ComponentActivity() {
 
         setContent {
             MaterialTheme {
-                Surface(color = Color(0xFF121212), contentColor = Color.White) {
-                    StreamScreen()
+                Surface(color = Color(0xFF0D1117), contentColor = Color.White) {
+                    MainApp()
                 }
             }
         }
     }
 
     @Composable
-    fun StreamScreen() {
+    fun MainApp() {
+        // --- SHARED STATE ---
+        var currentScreen by remember { mutableStateOf("HOME") }
+
         var logs by remember { mutableStateOf("System Initialized.\nWaiting for user...") }
         var mseDisplay by remember { mutableStateOf("0.0000") }
         var latencyDisplay by remember { mutableStateOf("0 ms") }
-        var statusDisplay by remember { mutableStateOf("IDLE") }
-        var statusColor by remember { mutableStateOf(Color.Gray) }
+        var statusDisplay by remember { mutableStateOf("AWAITING CONNECTION") }
+        var statusColor by remember { mutableStateOf(Color.DarkGray) }
 
-        val scrollState = rememberScrollState()
+        // State for the graph
+        var graphData by remember { mutableStateOf(FloatArray(0)) }
+        var isBuffering by remember { mutableStateOf(true) }
 
         val permissionsToRequest = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             arrayOf(Manifest.permission.BLUETOOTH_SCAN, Manifest.permission.BLUETOOTH_CONNECT)
@@ -65,62 +78,46 @@ class MainActivity : ComponentActivity() {
             if (perms.values.all { it }) {
                 logs += "\nPermissions Granted. Connecting..."
                 streamManager?.connect()
-                statusDisplay = "SCANNING"
-                statusColor = Color(0xFFFF9800)
+                statusDisplay = "BUFFERING SIGNAL (10s)..."
+                statusColor = Color(0xFFE67E22) // Orange
+                isBuffering = true
             } else {
                 logs += "\nPermissions Denied."
             }
         }
 
+        // --- BACKGROUND MANAGER ---
         if (streamManager == null) {
             streamManager = BleStreamManager(
                 context = this,
                 onLog = { msg -> runOnUiThread { logs += "\n$msg" } },
                 onDataReceived = { inputData, _ ->
-                    runOnUiThread {
-                        statusDisplay = "PROCESSING"
-                        statusColor = Color(0xFF2196F3)
-                    }
 
                     val tStart = System.nanoTime()
 
-                    // --- 1. UNIT CONVERSION ---
-                    // The structural check (> 0.4) demands clinical mV units.
-                    // IMPORTANT: Adjust this multiplier based on your ESP32's ADC resolution!
-                    // If your ESP32 already sends mV, keep this as 1.0f.
-                    val mvData = FloatArray(inputData.size) { i -> inputData[i] * 1.0f }
+                    val mvData = FloatArray(inputData.size) { i -> inputData[i] * 0.001f }
+                    val cleanData = SignalProcessor.cleanSignal(mvData)
 
-                    // --- 2. CLEANING (Matching SciPy) ---
-                    var cleanData = SignalProcessor.cleanSignal(mvData)
-
-                    // --- 3. GATEKEEPER ---
                     if (!SignalProcessor.isMechanicallySound(cleanData)) {
                         runOnUiThread {
-                            statusDisplay = "ARTIFACT/MOTION"
+                            statusDisplay = "ARTIFACT / MOTION DETECTED"
                             statusColor = Color.DarkGray
-                            logs += "\n[Warning] Signal dropped by Gatekeeper (Noise/Flatline)."
+                            logs += "\n[Warning] Signal dropped by Gatekeeper."
                         }
                         return@BleStreamManager
                     }
 
-                    // --- 4. FORMAT FOR MODEL (Mean Centering) ---
                     val mu = cleanData.average().toFloat()
                     val centeredData = FloatArray(cleanData.size) { i -> cleanData[i] - mu }
 
-                    // --- 5. INFERENCE & STRUCTURAL CHECK ---
                     var finalMse = 0f
                     var isStructural = true
 
                     if (model != null) {
                         try {
-                            // NOTE: You must update ECGModel to return a Pair<Float, FloatArray>
-                            // containing both the MSE and the Reconstructed array.
                             val (rawMse, reconstructedData) = model!!.runInference(centeredData)
-
                             isStructural = SignalProcessor.checkStructuralError(centeredData, reconstructedData, rawMse)
-
                             finalMse = if (rawMse > 0.30f && !isStructural) 0.0f else rawMse
-
                         } catch (e: Exception) {
                             logs += "\nModel Error: ${e.message}"
                         }
@@ -129,87 +126,213 @@ class MainActivity : ComponentActivity() {
                     val tEnd = System.nanoTime()
                     val inferenceTimeMs = (tEnd - tStart) / 1_000_000.0
 
-                    // --- 6. UPDATE UI ---
+                    // --- UPDATE UI STATE ---
                     runOnUiThread {
+                        isBuffering = false
                         mseDisplay = String.format("%.4f", finalMse)
-                        latencyDisplay = String.format("%.2f ms", inferenceTimeMs)
+                        latencyDisplay = String.format("%.1f ms", inferenceTimeMs)
                         logs += "\n[Prediction] MSE: $mseDisplay | Structural: $isStructural"
+
+                        // Extract the last 500 samples (2 seconds) for a clean visual plot
+                        graphData = if (centeredData.size >= 500) {
+                            centeredData.copyOfRange(centeredData.size - 500, centeredData.size)
+                        } else {
+                            centeredData
+                        }
 
                         if (finalMse > 0.30f) {
                             statusDisplay = "ANOMALY DETECTED"
-                            statusColor = Color.Red
+                            statusColor = Color(0xFFE74C3C) // Red
                         } else {
                             statusDisplay = "NORMAL RHYTHM"
-                            statusColor = Color(0xFF4CAF50)
+                            statusColor = Color(0xFF2ECC71) // Green
                         }
                     }
                 }
             )
         }
 
-        // --- UI LAYOUT ---
-        Column(
-            modifier = Modifier.fillMaxSize().padding(16.dp),
-            horizontalAlignment = Alignment.CenterHorizontally
-        ) {
-            Text("ECG AI Monitor", fontSize = 28.sp, fontWeight = FontWeight.Bold, color = Color.White)
-            Spacer(Modifier.height(20.dp))
-
-            Card(colors = CardDefaults.cardColors(containerColor = statusColor), modifier = Modifier.fillMaxWidth().height(80.dp)) {
-                Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                    Text(statusDisplay, fontSize = 22.sp, fontWeight = FontWeight.Black, color = Color.White)
+        // --- NAVIGATION ROUTING ---
+        // Added .systemBarsPadding() right here to fix the overlap issue!
+        Column(modifier = Modifier.fillMaxSize().systemBarsPadding()) {
+            // Custom Top Bar
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .background(Color(0xFF161B22))
+                    .padding(horizontal = 16.dp, vertical = 12.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text("ECGGuard", fontSize = 22.sp, fontWeight = FontWeight.Bold, color = Color.White)
+                IconButton(onClick = { currentScreen = if (currentScreen == "HOME") "SETTINGS" else "HOME" }) {
+                    Icon(
+                        imageVector = if (currentScreen == "HOME") Icons.Default.Settings else Icons.Default.Close,
+                        contentDescription = "Menu",
+                        tint = Color.White
+                    )
                 }
             }
 
-            Spacer(Modifier.height(16.dp))
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                MetricCard("MSE Error", mseDisplay)
-                MetricCard("Latency", latencyDisplay)
-            }
-
-            Spacer(Modifier.height(24.dp))
-            Button(
-                onClick = { permissionLauncher.launch(permissionsToRequest) },
-                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF6200EE)),
-                modifier = Modifier.fillMaxWidth().height(50.dp)
-            ) {
-                Text("CONNECT STREAM", fontSize = 16.sp)
-            }
-
-            Spacer(Modifier.height(16.dp))
-            Text("System Logs:", color = Color.Gray, fontSize = 14.sp, modifier = Modifier.align(Alignment.Start))
-            Box(modifier = Modifier.fillMaxWidth().weight(1f).background(Color(0xFF1E1E1E)).padding(8.dp).verticalScroll(scrollState)) {
-                Text(logs, fontSize = 12.sp, color = Color.LightGray, lineHeight = 16.sp)
+            // Screen Content
+            if (currentScreen == "HOME") {
+                HomeScreen(statusDisplay, statusColor, mseDisplay, latencyDisplay, graphData, isBuffering)
+            } else {
+                SettingsScreen(logs, { permissionLauncher.launch(permissionsToRequest) })
             }
         }
     }
 
     @Composable
-    fun MetricCard(title: String, value: String) {
-        Card(colors = CardDefaults.cardColors(containerColor = Color(0xFF2C2C2C)), modifier = Modifier.width(160.dp).padding(4.dp)) {
-            Column(Modifier.padding(16.dp)) {
-                Text(title, color = Color.Gray, fontSize = 14.sp)
-                Text(value, color = Color.White, fontSize = 20.sp, fontWeight = FontWeight.Bold)
+    fun HomeScreen(
+        statusDisplay: String, statusColor: Color,
+        mseDisplay: String, latencyDisplay: String,
+        graphData: FloatArray, isBuffering: Boolean
+    ) {
+        Column(modifier = Modifier.fillMaxSize().padding(16.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+
+            // 1. STATUS BANNER
+            Card(
+                colors = CardDefaults.cardColors(containerColor = statusColor),
+                shape = RoundedCornerShape(12.dp),
+                modifier = Modifier.fillMaxWidth().height(70.dp)
+            ) {
+                Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                    Text(statusDisplay, fontSize = 20.sp, fontWeight = FontWeight.Black, color = Color.White, letterSpacing = 1.sp)
+                }
+            }
+
+            Spacer(Modifier.height(24.dp))
+
+            // 2. LIVE ECG PLOT
+            Card(
+                colors = CardDefaults.cardColors(containerColor = Color(0xFF000000)),
+                shape = RoundedCornerShape(12.dp),
+                modifier = Modifier.fillMaxWidth().height(250.dp)
+            ) {
+                Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                    if (isBuffering) {
+                        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                            CircularProgressIndicator(color = Color(0xFF2ECC71))
+                            Spacer(Modifier.height(16.dp))
+                            Text("Filling 10-Second Buffer...", color = Color.Gray)
+                        }
+                    } else {
+                        ECGChart(graphData)
+                    }
+                }
+            }
+
+            Spacer(Modifier.height(24.dp))
+
+            // 3. AI METRICS
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                MetricCard("Mean Squared Error", mseDisplay, modifier = Modifier.weight(1f))
+                Spacer(Modifier.width(16.dp))
+                MetricCard("Inference Latency", latencyDisplay, modifier = Modifier.weight(1f))
+            }
+        }
+    }
+
+    @Composable
+    fun ECGChart(data: FloatArray) {
+        if (data.isEmpty()) return
+
+        Canvas(modifier = Modifier.fillMaxSize().padding(8.dp)) {
+            val width = size.width
+            val height = size.height
+
+            // Draw Background Grid (Simulating ECG Paper)
+            val gridPaint = Color(0xFF003300)
+            for (i in 0..10) {
+                val y = height * (i / 10f)
+                drawLine(gridPaint, Offset(0f, y), Offset(width, y), strokeWidth = 1f)
+                val x = width * (i / 10f)
+                drawLine(gridPaint, Offset(x, 0f), Offset(x, height), strokeWidth = 1f)
+            }
+
+            // Scale data to fit Canvas
+            val maxVal = data.maxOrNull() ?: 1f
+            val minVal = data.minOrNull() ?: -1f
+            val range = (maxVal - minVal).coerceAtLeast(0.1f) // Prevent div by zero
+
+            val path = Path()
+            val stepX = width / (data.size - 1)
+
+            data.forEachIndexed { index, value ->
+                val x = index * stepX
+                // Normalize Y to canvas height (inverted because Y grows downwards)
+                val normalizedY = (value - minVal) / range
+                val y = height - (normalizedY * height)
+
+                if (index == 0) path.moveTo(x, y) else path.lineTo(x, y)
+            }
+
+            // Draw the neon green ECG line
+            drawPath(path = path, color = Color(0xFF00FF00), style = Stroke(width = 3f))
+        }
+    }
+
+    @Composable
+    fun SettingsScreen(logs: String, onConnect: () -> Unit) {
+        val scrollState = rememberScrollState()
+
+        Column(modifier = Modifier.fillMaxSize().padding(16.dp)) {
+            Text("Device Connectivity", fontSize = 20.sp, fontWeight = FontWeight.Bold, color = Color.White)
+            Spacer(Modifier.height(16.dp))
+
+            Button(
+                onClick = onConnect,
+                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF3498DB)),
+                modifier = Modifier.fillMaxWidth().height(55.dp),
+                shape = RoundedCornerShape(8.dp)
+            ) {
+                Text("SCAN & CONNECT WEARABLE", fontSize = 16.sp, fontWeight = FontWeight.Bold)
+            }
+
+            Spacer(Modifier.height(24.dp))
+            Text("System Diagnostics:", color = Color.Gray, fontSize = 14.sp)
+            Spacer(Modifier.height(8.dp))
+
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .weight(1f)
+                    .background(Color(0xFF161B22), RoundedCornerShape(8.dp))
+                    .padding(12.dp)
+                    .verticalScroll(scrollState)
+            ) {
+                Text(logs, fontSize = 12.sp, color = Color(0xFF58A6FF), lineHeight = 18.sp, fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace)
+            }
+        }
+    }
+
+    @Composable
+    fun MetricCard(title: String, value: String, modifier: Modifier = Modifier) {
+        Card(
+            colors = CardDefaults.cardColors(containerColor = Color(0xFF161B22)),
+            shape = RoundedCornerShape(12.dp),
+            modifier = modifier.height(100.dp)
+        ) {
+            Column(Modifier.padding(16.dp).fillMaxSize(), verticalArrangement = Arrangement.Center) {
+                Text(title, color = Color.Gray, fontSize = 12.sp, fontWeight = FontWeight.Medium)
+                Spacer(Modifier.height(4.dp))
+                Text(value, color = Color.White, fontSize = 24.sp, fontWeight = FontWeight.Bold)
             }
         }
     }
 }
 
 // ======================================================================
-// MATHEMATICAL CLONE OF PYTHON SCIPY/NUMPY PIPELINE
+// MATHEMATICAL CLONE OF PYTHON SCIPY/NUMPY PIPELINE (Unchanged)
 // ======================================================================
 object SignalProcessor {
 
     fun cleanSignal(input: FloatArray): FloatArray {
-        // 1. np.nan_to_num (Replace NaNs and Infs)
         val cleaned = FloatArray(input.size) { i ->
             if (input[i].isNaN() || input[i].isInfinite()) 0.0f else input[i]
         }
-
-        // 2. scipy.signal.detrend(type='linear')
         val detrended = linearDetrend(cleaned)
-
-        // 3. scipy.signal.savgol_filter(window_length=11, polyorder=3)
         return savgolFilter11Tap(detrended)
     }
 
@@ -229,7 +352,7 @@ object SignalProcessor {
         }
 
         val denominator = (n * sumX2) - (sumX * sumX)
-        if (denominator == 0f) return y // Fallback to avoid division by zero
+        if (denominator == 0f) return y
 
         val m = ((n * sumXY) - (sumX * sumY)) / denominator
         val c = (sumY - (m * sumX)) / n
@@ -238,7 +361,6 @@ object SignalProcessor {
     }
 
     private fun savgolFilter11Tap(data: FloatArray): FloatArray {
-        // Exact mathematical coefficients for SG window=11, poly=3
         val coeffs = floatArrayOf(-36f, 9f, 44f, 69f, 84f, 89f, 84f, 69f, 44f, 9f, -36f)
         val norm = 429f
         val result = FloatArray(data.size)
@@ -247,7 +369,6 @@ object SignalProcessor {
         for (i in data.indices) {
             var sum = 0f
             for (j in -halfWindow..halfWindow) {
-                // Edge padding: copy nearest valid value
                 val idx = (i + j).coerceIn(0, data.size - 1)
                 sum += data[idx] * coeffs[j + halfWindow]
             }

@@ -4,6 +4,7 @@ import android.annotation.SuppressLint
 import android.bluetooth.*
 import android.bluetooth.le.ScanCallback
 import android.bluetooth.le.ScanResult
+import android.bluetooth.le.ScanSettings
 import android.content.Context
 import android.os.Build
 import android.os.Handler
@@ -29,16 +30,10 @@ class BleStreamManager(
     private val TARGET_CHAR_UUID    = UUID.fromString("beb5483e-36e1-4688-b7f5-ea07361b26a5")
     private val CONFIG_DESC         = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
 
-    // --- STREAMING VARIABLES ---
     private val signalBuffer = ArrayList<Float>()
-
-    // CRITICAL FIX: Model requires 2500 samples (10 seconds @ 250Hz)
     private val REQUIRED_SIZE = 2500
-
-    // Keep a slightly larger buffer to allow for sliding window (e.g., 12 seconds)
     private val MAX_BUFFER_SIZE = 3000
 
-    // --- LATENCY METRICS ---
     private var firstPacketTime = 0L
     private var lastPacketTime = 0L
     private var packetCount = 0
@@ -53,8 +48,15 @@ class BleStreamManager(
             log("Bluetooth disabled!")
             return
         }
-        log("Scanning for Streamer...")
-        adapter.bluetoothLeScanner.startScan(scanCallback)
+        log("Scanning for Streamer (Brute Force Mode)...")
+
+        // 1. Force Aggressive Scan
+        val settings = ScanSettings.Builder()
+            .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
+            .build()
+
+        // 2. Use NULL filter so Android OS doesn't hide anything from us
+        adapter.bluetoothLeScanner.startScan(null, settings, scanCallback)
 
         Handler(Looper.getMainLooper()).postDelayed({
             if (gatt == null) {
@@ -69,11 +71,21 @@ class BleStreamManager(
     private val scanCallback = object : ScanCallback() {
         override fun onScanResult(callbackType: Int, result: ScanResult?) {
             val device = result?.device ?: return
-            val name = device.name ?: "NULL"
 
-            val isNameMatch = name == "ECG_STREAMER"
+            // Check both standard name and ScanRecord name (Bypasses Android 12 null bugs)
+            val name = device.name ?: result.scanRecord?.deviceName ?: "Unknown Device"
+
+            // LOG EVERY DEVICE WE SEE so you can check Logcat if it fails
+            Log.d("ECG_SCAN", "Found: $name | MAC: ${device.address}")
+
+            // Accept the new name AND the old cached names!
+            val isNameMatch = name == "ECG_STREAMER" ||
+                    name == "FYP-Test-Heartbeat" ||
+                    name == "ECG_LATENCY_TEST"
+
+            // Case-insensitive UUID match
             val isUuidMatch = result.scanRecord?.serviceUuids?.any {
-                it.uuid.toString() == TARGET_SERVICE_UUID.toString()
+                it.uuid.toString().equals(TARGET_SERVICE_UUID.toString(), ignoreCase = true)
             } == true
 
             if (isNameMatch || isUuidMatch) {
@@ -81,6 +93,10 @@ class BleStreamManager(
                 adapter.bluetoothLeScanner.stopScan(this)
                 device.connectGatt(context, false, gattCallback)
             }
+        }
+
+        override fun onScanFailed(errorCode: Int) {
+            log("SCAN CRASHED! Error Code: $errorCode")
         }
     }
 
@@ -118,7 +134,6 @@ class BleStreamManager(
                         gatt.writeDescriptor(desc)
                     }
                 }
-
                 firstPacketTime = 0L
                 packetCount = 0
                 signalBuffer.clear()
@@ -141,26 +156,17 @@ class BleStreamManager(
             lastPacketTime = now
             packetCount++
 
-            // Convert Bytes -> Floats
             val buffer = ByteBuffer.wrap(data).order(ByteOrder.LITTLE_ENDIAN)
             while (buffer.remaining() >= 2) {
                 val sample = buffer.short.toFloat()
                 signalBuffer.add(sample)
             }
 
-            // CHECK BUFFER SIZE
-            // FIX: Wait for 2500 samples (10 seconds) because the Model demands it
             if (signalBuffer.size >= REQUIRED_SIZE) {
-
-                // Grab the LAST 2500 samples
                 val inputData = signalBuffer.takeLast(REQUIRED_SIZE).toFloatArray()
+                onDataReceived(inputData, "Pkt #$packetCount | Buffer: ${signalBuffer.size}")
 
-                val msg = "Pkt #$packetCount | Buffer: ${signalBuffer.size}"
-                onDataReceived(inputData, msg)
-
-                // Keep buffer size managed
                 if (signalBuffer.size > MAX_BUFFER_SIZE) {
-                    // Remove old data to slide the window (Remove 1 sec = 250 samples)
                     signalBuffer.subList(0, 250).clear()
                 }
             }
