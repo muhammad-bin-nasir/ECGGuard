@@ -420,6 +420,6 @@ object SignalProcessor {
             val errorTotal = totalErrorSum / input.size
             return errorInQrs > errorTotal
         }
-        return false
+        return true
     }
 }
