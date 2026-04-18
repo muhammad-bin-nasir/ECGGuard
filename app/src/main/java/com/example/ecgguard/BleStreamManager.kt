@@ -26,9 +26,9 @@ class BleStreamManager(
     private var gatt: BluetoothGatt? = null
 
     // --- CONFIGURATION ---
-    private val TARGET_SERVICE_UUID = UUID.fromString("4fafc201-1fb5-459e-8fcc-c5c9c331914a")
-    private val TARGET_CHAR_UUID    = UUID.fromString("beb5483e-36e1-4688-b7f5-ea07361b26a5")
-    private val CONFIG_DESC         = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
+    private val TARGET_SERVICE_UUID = BleProfile.serviceUuid
+    private val TARGET_CHAR_UUID = BleProfile.characteristicUuid
+    private val CONFIG_DESC = BleProfile.clientConfigDescriptorUuid
 
     private val signalBuffer = ArrayList<Float>()
     private val REQUIRED_SIZE = 2500
@@ -37,10 +37,35 @@ class BleStreamManager(
     private var firstPacketTime = 0L
     private var lastPacketTime = 0L
     private var packetCount = 0
+    private var discoveryRetried = false
+    private val scanTimeoutHandler = Handler(Looper.getMainLooper())
+    private var scanTimeoutRunnable: Runnable? = null
 
     private fun log(msg: String) {
         Log.d("ECG_DEBUG", msg)
         onLog(msg)
+    }
+
+    private fun stopScanSafely() {
+        try {
+            adapter?.bluetoothLeScanner?.stopScan(scanCallback)
+        } catch (_: Exception) {
+        }
+    }
+
+    private fun cancelScanTimeout() {
+        scanTimeoutRunnable?.let { scanTimeoutHandler.removeCallbacks(it) }
+        scanTimeoutRunnable = null
+    }
+
+    private fun refreshDeviceCache(gatt: BluetoothGatt): Boolean {
+        return try {
+            val method = gatt.javaClass.getMethod("refresh")
+            method.invoke(gatt) as? Boolean ?: false
+        } catch (e: Exception) {
+            log("Cache refresh skipped: ${e.message}")
+            false
+        }
     }
 
     fun connect() {
@@ -48,24 +73,28 @@ class BleStreamManager(
             log("Bluetooth disabled!")
             return
         }
-        log("Scanning for Streamer (Brute Force Mode)...")
 
-        // 1. Force Aggressive Scan
+        cancelScanTimeout()
+        stopScanSafely()
+        gatt?.close()
+        gatt = null
+        discoveryRetried = false
+
+        log("Scanning for ECGGuard_BLE...")
+
         val settings = ScanSettings.Builder()
             .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
             .build()
 
-        // 2. Use NULL filter so Android OS doesn't hide anything from us
         adapter.bluetoothLeScanner.startScan(null, settings, scanCallback)
 
-        Handler(Looper.getMainLooper()).postDelayed({
+        scanTimeoutRunnable = Runnable {
             if (gatt == null) {
-                try {
-                    adapter.bluetoothLeScanner.stopScan(scanCallback)
-                    log("Scan timeout. ESP32 not found.")
-                } catch (e: Exception) {}
+                stopScanSafely()
+                log("Scan timeout. ESP32 not found.")
             }
-        }, 10000)
+        }
+        scanTimeoutHandler.postDelayed(scanTimeoutRunnable!!, 10000)
     }
 
     private val scanCallback = object : ScanCallback() {
@@ -78,10 +107,8 @@ class BleStreamManager(
             // LOG EVERY DEVICE WE SEE so you can check Logcat if it fails
             Log.d("ECG_SCAN", "Found: $name | MAC: ${device.address}")
 
-            // Accept the new name AND the old cached names!
-            val isNameMatch = name == "ECG_STREAMER" ||
-                    name == "FYP-Test-Heartbeat" ||
-                    name == "ECG_LATENCY_TEST"
+            // Accept the current ESP32 name and legacy names.
+            val isNameMatch = BleProfile.knownDeviceNames.contains(name)
 
             // Case-insensitive UUID match
             val isUuidMatch = result.scanRecord?.serviceUuids?.any {
@@ -89,9 +116,10 @@ class BleStreamManager(
             } == true
 
             if (isNameMatch || isUuidMatch) {
+                cancelScanTimeout()
+                stopScanSafely()
                 log("TARGET FOUND ($name)! Connecting...")
-                adapter.bluetoothLeScanner.stopScan(this)
-                device.connectGatt(context, false, gattCallback)
+                gatt = device.connectGatt(context, false, gattCallback)
             }
         }
 
@@ -102,24 +130,58 @@ class BleStreamManager(
 
     private val gattCallback = object : BluetoothGattCallback() {
         override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
+            if (status != BluetoothGatt.GATT_SUCCESS) {
+                log("Connection error. Status: $status")
+                gatt.close()
+                this@BleStreamManager.gatt = null
+                return
+            }
+
             if (newState == BluetoothProfile.STATE_CONNECTED) {
-                log("Connected. Requesting MTU 512...")
-                gatt.requestMtu(512)
+                cancelScanTimeout()
+                this@BleStreamManager.gatt = gatt
+                discoveryRetried = false
+                log("Connected. Refreshing cache...")
+                refreshDeviceCache(gatt)
+                Handler(Looper.getMainLooper()).postDelayed({
+                    log("Requesting MTU 512...")
+                    val requested = gatt.requestMtu(512)
+                    if (!requested) {
+                        log("MTU request not supported. Discovering services...")
+                        gatt.discoverServices()
+                    }
+                }, 600)
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
+                cancelScanTimeout()
                 log("Disconnected.")
+                gatt.close()
                 this@BleStreamManager.gatt = null
             }
         }
 
         override fun onMtuChanged(gatt: BluetoothGatt?, mtu: Int, status: Int) {
-            log("MTU Changed to: $mtu. Discovering Services...")
+            if (status == BluetoothGatt.GATT_SUCCESS) {
+                log("MTU changed to $mtu. Discovering services...")
+            } else {
+                log("MTU change failed (status $status). Discovering services...")
+            }
             gatt?.discoverServices()
         }
 
         override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
-            val charac = gatt.getService(TARGET_SERVICE_UUID)?.getCharacteristic(TARGET_CHAR_UUID)
+            if (status != BluetoothGatt.GATT_SUCCESS) {
+                log("Service discovery failed. Status: $status")
+                return
+            }
+
+            val discoveredServices = gatt.services.joinToString { it.uuid.toString() }
+            log("Services discovered: $discoveredServices")
+
+            val service = gatt.getService(TARGET_SERVICE_UUID)
+            val charac = service?.getCharacteristic(TARGET_CHAR_UUID)
+
             if (charac != null) {
-                log("Service Found! Stream Starting (Wait 10s)...")
+                log("Service found. Notifications enabled.")
                 this@BleStreamManager.gatt = gatt
 
                 gatt.setCharacteristicNotification(charac, true)
@@ -133,12 +195,20 @@ class BleStreamManager(
                         @Suppress("DEPRECATION")
                         gatt.writeDescriptor(desc)
                     }
+                } else {
+                    log("Error: Notification descriptor missing on characteristic.")
                 }
                 firstPacketTime = 0L
                 packetCount = 0
                 signalBuffer.clear()
+            } else if (!discoveryRetried) {
+                discoveryRetried = true
+                log("Target service/characteristic not found. Retrying discovery...")
+                refreshDeviceCache(gatt)
+                Handler(Looper.getMainLooper()).postDelayed({ gatt.discoverServices() }, 800)
             } else {
-                log("Error: Target Characteristic not found!")
+                val serviceState = if (service == null) "service missing" else "characteristic missing"
+                log("Error: BLE target not found after retry ($serviceState).")
             }
         }
 
@@ -151,6 +221,8 @@ class BleStreamManager(
         }
 
         private fun processBytes(data: ByteArray) {
+            if (data.isEmpty()) return
+
             val now = System.currentTimeMillis()
             if (firstPacketTime == 0L) firstPacketTime = now
             lastPacketTime = now

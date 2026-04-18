@@ -19,14 +19,9 @@ class BleLatencyManager(private val context: Context, private val onLog: (String
     private var gatt: BluetoothGatt? = null
 
     // --- CONFIGURATION (MUST MATCH ESP32) ---
-    // ESP32: ...14a
-    private val TARGET_SERVICE_UUID_STR = "4fafc201-1fb5-459e-8fcc-c5c9c331914a"
-    // ESP32: ...6a5
-    private val TARGET_CHAR_UUID_STR    = "beb5483e-36e1-4688-b7f5-ea07361b26a5"
-
-    private val SERVICE_UUID = UUID.fromString(TARGET_SERVICE_UUID_STR)
-    private val CHAR_UUID    = UUID.fromString(TARGET_CHAR_UUID_STR)
-    private val CONFIG_DESC  = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
+    private val SERVICE_UUID = BleProfile.serviceUuid
+    private val CHAR_UUID = BleProfile.characteristicUuid
+    private val CONFIG_DESC = BleProfile.clientConfigDescriptorUuid
 
     private var startTime = 0L
     private var scanTimeoutHandler = Handler(Looper.getMainLooper())
@@ -43,7 +38,7 @@ class BleLatencyManager(private val context: Context, private val onLog: (String
             return
         }
 
-        log("Scanning for ESP32 (looking for ID ending in ...4a)...")
+        log("Scanning for ECGGuard_BLE...")
         adapter.bluetoothLeScanner.startScan(scanCallback)
 
         scanTimeoutRunnable = Runnable {
@@ -62,7 +57,7 @@ class BleLatencyManager(private val context: Context, private val onLog: (String
             val device = result?.device ?: return
             val name = device.name ?: "NULL"
 
-            val isNameMatch = name == "ECG_LATENCY_TEST" || name == "FYP-Test-Heartbeat"
+            val isNameMatch = BleProfile.knownDeviceNames.contains(name)
 
             // Loose UUID match to find it even if cache is stale
             val records = result.scanRecord?.serviceUuids
