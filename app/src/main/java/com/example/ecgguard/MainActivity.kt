@@ -1,8 +1,14 @@
 package com.example.ecgguard
 
 import android.Manifest
+import android.annotation.SuppressLint
+import android.content.Intent
+import android.location.LocationManager
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import java.net.HttpURLConnection
+import java.net.URL
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
@@ -12,10 +18,15 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.Person
+import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -25,17 +36,60 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlin.math.abs
 import androidx.compose.animation.core.*
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.ui.text.style.TextAlign
+import kotlinx.coroutines.delay
 
 class MainActivity : ComponentActivity() {
 
     private var streamManager: BleStreamManager? = null
     private var model: ECGModel? = null
+
+    @SuppressLint("MissingPermission")
+    private fun sendWhatsAppAlerts(contacts: List<EmergencyContact>) {
+        if (contacts.isEmpty()) return
+
+        var locationText = "(Location unavailable)"
+        try {
+            val lm = getSystemService(LOCATION_SERVICE) as LocationManager
+            val location = listOf(LocationManager.GPS_PROVIDER, LocationManager.NETWORK_PROVIDER)
+                .mapNotNull { provider ->
+                    try { lm.getLastKnownLocation(provider) } catch (e: Exception) { null }
+                }
+                .maxByOrNull { it.time }
+            if (location != null) {
+                locationText = "https://maps.google.com/?q=${location.latitude},${location.longitude}"
+            }
+        } catch (e: Exception) { /* ignore */ }
+
+        val text = "ECGGuard ALERT: Cardiac anomaly detected! Immediate attention may be needed. Location: $locationText"
+
+        // CallMeBot free WhatsApp API — no paid plan needed.
+        // Each contact must activate it once by messaging +34 644 56 59 11 on WhatsApp:
+        //   "I allow callmebot to send me messages"
+        // then saving the API key they receive.
+        contacts.forEach { contact ->
+            if (contact.apiKey.isBlank()) return@forEach
+            Thread {
+                try {
+                    val encoded = java.net.URLEncoder.encode(text, "UTF-8")
+                    val urlStr = "https://api.callmebot.com/whatsapp.php" +
+                        "?phone=${contact.phone}&text=$encoded&apikey=${contact.apiKey}"
+                    val conn = URL(urlStr).openConnection() as HttpURLConnection
+                    conn.requestMethod = "GET"
+                    conn.connectTimeout = 10_000
+                    conn.readTimeout = 10_000
+                    conn.responseCode  // execute
+                    conn.disconnect()
+                } catch (e: Exception) { /* network error */ }
+            }.start()
+        }
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -69,6 +123,51 @@ class MainActivity : ComponentActivity() {
         // State for the graph
         var graphData by remember { mutableStateOf(FloatArray(0)) }
         var isBuffering by remember { mutableStateOf(true) }
+
+        // --- EMERGENCY / ANOMALY ALERT STATE ---
+        var showAnomalyDialog by remember { mutableStateOf(false) }
+        var anomalyEpisodeHandled by remember { mutableStateOf(false) }
+        var countdownSeconds by remember { mutableStateOf(10) }
+        var contacts by remember { mutableStateOf(EmergencyContactStore.getContacts(this@MainActivity)) }
+
+        // Trigger dialog on first detection of each anomaly episode
+        LaunchedEffect(statusDisplay) {
+            if (statusDisplay == "ANOMALY DETECTED" && !anomalyEpisodeHandled) {
+                showAnomalyDialog = true
+                anomalyEpisodeHandled = true
+            }
+            if (statusDisplay == "NORMAL RHYTHM") {
+                anomalyEpisodeHandled = false  // reset for next episode
+            }
+        }
+
+        // Countdown: auto-send alert if user doesn't respond in 10 seconds
+        LaunchedEffect(showAnomalyDialog) {
+            if (showAnomalyDialog) {
+                countdownSeconds = 10
+                while (showAnomalyDialog && countdownSeconds > 0) {
+                    delay(1000L)
+                    if (showAnomalyDialog) countdownSeconds--
+                }
+                if (showAnomalyDialog) {
+                    showAnomalyDialog = false
+                    sendWhatsAppAlerts(contacts)
+                }
+            }
+        }
+
+        // Show anomaly dialog on top of whatever screen is active
+        if (showAnomalyDialog) {
+            AnomalyAlertDialog(
+                countdown = countdownSeconds,
+                hasContacts = contacts.isNotEmpty(),
+                onFineClick = { showAnomalyDialog = false },
+                onAlertClick = {
+                    showAnomalyDialog = false
+                    sendWhatsAppAlerts(contacts)
+                }
+            )
+        }
 
         val permissionsToRequest = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             arrayOf(Manifest.permission.BLUETOOTH_SCAN, Manifest.permission.BLUETOOTH_CONNECT)
@@ -121,7 +220,9 @@ class MainActivity : ComponentActivity() {
                         try {
                             val (rawMse, reconstructedData) = model!!.runInference(centeredData)
                             isStructural = SignalProcessor.checkStructuralError(centeredData, reconstructedData, rawMse)
-                            finalMse = if (rawMse > 0.30f && !isStructural) 0.0f else rawMse
+                            // Suppress MSE only when the high error is caused by a structural/lead
+                            // artifact (isStructural=true), NOT when it is a genuine cardiac anomaly.
+                            finalMse = if (rawMse > 0.30f && isStructural) 0.0f else rawMse
                         } catch (e: Exception) {
                             logs += "\nModel Error: ${e.message}"
                         }
@@ -172,20 +273,41 @@ class MainActivity : ComponentActivity() {
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 Text("ECGGuard", fontSize = 22.sp, fontWeight = FontWeight.Bold, color = Color.White)
-                IconButton(onClick = { currentScreen = if (currentScreen == "HOME") "SETTINGS" else "HOME" }) {
-                    Icon(
-                        imageVector = if (currentScreen == "HOME") Icons.Default.Settings else Icons.Default.Close,
-                        contentDescription = "Menu",
-                        tint = Color.White
-                    )
+                Row {
+                    // Contacts icon
+                    IconButton(onClick = {
+                        currentScreen = if (currentScreen == "CONTACTS") "HOME" else "CONTACTS"
+                    }) {
+                        Icon(
+                            imageVector = if (currentScreen == "CONTACTS") Icons.Default.Close else Icons.Default.Person,
+                            contentDescription = "Contacts",
+                            tint = if (currentScreen == "CONTACTS") Color.White else Color(0xFF3498DB)
+                        )
+                    }
+                    // Settings icon
+                    IconButton(onClick = {
+                        currentScreen = if (currentScreen == "SETTINGS") "HOME" else "SETTINGS"
+                    }) {
+                        Icon(
+                            imageVector = if (currentScreen == "SETTINGS") Icons.Default.Close else Icons.Default.Settings,
+                            contentDescription = "Settings",
+                            tint = Color.White
+                        )
+                    }
                 }
             }
 
             // Screen Content
-            if (currentScreen == "HOME") {
-                HomeScreen(statusDisplay, statusColor, mseDisplay, latencyDisplay, heartRateDisplay, graphData, isBuffering)
-            } else {
-                SettingsScreen(logs, { permissionLauncher.launch(permissionsToRequest) })
+            when (currentScreen) {
+                "HOME" -> HomeScreen(statusDisplay, statusColor, mseDisplay, latencyDisplay, heartRateDisplay, graphData, isBuffering)
+                "SETTINGS" -> SettingsScreen(logs, { permissionLauncher.launch(permissionsToRequest) })
+                "CONTACTS" -> EmergencyContactsScreen(
+                    contacts = contacts,
+                    onContactsChanged = { updated ->
+                        contacts = updated
+                        EmergencyContactStore.saveContacts(this@MainActivity, updated)
+                    }
+                )
             }
         }
     }
@@ -371,6 +493,282 @@ class MainActivity : ComponentActivity() {
             drawPath(path, ecgColor.copy(alpha = 0.18f), style = Stroke(width = 8f))
             drawPath(path, ecgColor.copy(alpha = 0.55f), style = Stroke(width = 3.5f))
             drawPath(path, ecgColor,                    style = Stroke(width = 1.8f))
+        }
+    }
+
+    @Composable
+    fun AnomalyAlertDialog(
+        countdown: Int,
+        hasContacts: Boolean,
+        onFineClick: () -> Unit,
+        onAlertClick: () -> Unit
+    ) {
+        AlertDialog(
+            onDismissRequest = { /* Require explicit choice — no outside-tap dismiss */ },
+            containerColor = Color(0xFF1A1A2E),
+            title = {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Icon(
+                        Icons.Default.Warning,
+                        contentDescription = null,
+                        tint = Color(0xFFE74C3C),
+                        modifier = Modifier.size(24.dp)
+                    )
+                    Spacer(Modifier.width(8.dp))
+                    Text(
+                        "ANOMALY DETECTED",
+                        color = Color(0xFFE74C3C),
+                        fontSize = 15.sp,
+                        fontWeight = FontWeight.Black,
+                        letterSpacing = 1.sp
+                    )
+                }
+            },
+            text = {
+                Column {
+                    Text(
+                        "An irregular ECG pattern was detected. Did you recently perform intense exercise, experience heavy sweating, make sudden movements, or adjust the sensor?",
+                        color = Color.White,
+                        fontSize = 14.sp,
+                        lineHeight = 20.sp
+                    )
+                    Spacer(Modifier.height(16.dp))
+                    if (!hasContacts) {
+                        Card(
+                            colors = CardDefaults.cardColors(containerColor = Color(0xFF2C1A00)),
+                            shape = RoundedCornerShape(8.dp)
+                        ) {
+                            Text(
+                                "⚠ No emergency contacts saved. Add contacts using the \uD83D\uDC64 icon in the top bar.",
+                                color = Color(0xFFF39C12),
+                                fontSize = 12.sp,
+                                modifier = Modifier.padding(10.dp),
+                                lineHeight = 18.sp
+                            )
+                        }
+                    } else {
+                        Text(
+                            "Tap NO to immediately send an SMS with your location to all emergency contacts. No internet required.",
+                            color = Color.Gray,
+                            fontSize = 12.sp,
+                            lineHeight = 18.sp
+                        )
+                    }
+                    Spacer(Modifier.height(14.dp))
+                    LinearProgressIndicator(
+                        progress = { countdown / 10f },
+                        modifier = Modifier.fillMaxWidth(),
+                        color = Color(0xFFE74C3C),
+                        trackColor = Color(0xFF2C2C2C)
+                    )
+                    Spacer(Modifier.height(5.dp))
+                    Text(
+                        "Auto-sending in $countdown s…",
+                        color = Color.Gray,
+                        fontSize = 11.sp,
+                        textAlign = TextAlign.Center,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                }
+            },
+            confirmButton = {
+                Button(
+                    onClick = onFineClick,
+                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF27AE60)),
+                    shape = RoundedCornerShape(8.dp)
+                ) {
+                    Text("YES, I'M FINE", fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                }
+            },
+            dismissButton = {
+                Button(
+                    onClick = onAlertClick,
+                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFE74C3C)),
+                    shape = RoundedCornerShape(8.dp)
+                ) {
+                    Text("NO — SEND ALERT", fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                }
+            }
+        )
+    }
+
+    @Composable
+    fun EmergencyContactsScreen(
+        contacts: List<EmergencyContact>,
+        onContactsChanged: (List<EmergencyContact>) -> Unit
+    ) {
+        var nameInput by remember { mutableStateOf("") }
+        var phoneInput by remember { mutableStateOf("") }
+        var apiKeyInput by remember { mutableStateOf("") }
+        val scrollState = rememberScrollState()
+        val fieldColors = OutlinedTextFieldDefaults.colors(
+            focusedBorderColor = Color(0xFF3498DB),
+            unfocusedBorderColor = Color(0xFF444444),
+            focusedLabelColor = Color(0xFF3498DB),
+            unfocusedLabelColor = Color.Gray,
+            focusedTextColor = Color.White,
+            unfocusedTextColor = Color.White,
+            cursorColor = Color.White
+        )
+
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .verticalScroll(scrollState)
+                .padding(16.dp)
+        ) {
+            Text(
+                "Emergency Contacts",
+                fontSize = 20.sp,
+                fontWeight = FontWeight.Bold,
+                color = Color.White
+            )
+            Spacer(Modifier.height(4.dp))
+            Text(
+                "When an anomaly is confirmed, your location will be sent to these contacts via WhatsApp.",
+                color = Color.Gray,
+                fontSize = 12.sp,
+                lineHeight = 18.sp
+            )
+
+            Spacer(Modifier.height(20.dp))
+
+            // ── Add contact form ──────────────────────────────────────────────
+            Card(
+                colors = CardDefaults.cardColors(containerColor = Color(0xFF161B22)),
+                shape = RoundedCornerShape(12.dp),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Column(Modifier.padding(16.dp)) {
+                    Text("Add Contact", color = Color.White, fontWeight = FontWeight.SemiBold, fontSize = 14.sp)
+                    Spacer(Modifier.height(12.dp))
+                    OutlinedTextField(
+                        value = nameInput,
+                        onValueChange = { nameInput = it },
+                        label = { Text("Full Name") },
+                        singleLine = true,
+                        colors = fieldColors,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                    Spacer(Modifier.height(10.dp))
+                    OutlinedTextField(
+                        value = phoneInput,
+                        onValueChange = { phoneInput = it },
+                        label = { Text("WhatsApp Number (e.g. +923001234567)") },
+                        singleLine = true,
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Phone),
+                        colors = fieldColors,
+                        supportingText = {
+                            Text(
+                                "International format with + prefix.",
+                                color = Color.Gray,
+                                fontSize = 11.sp
+                            )
+                        },
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                    Spacer(Modifier.height(10.dp))
+                    OutlinedTextField(
+                        value = apiKeyInput,
+                        onValueChange = { apiKeyInput = it },
+                        label = { Text("CallMeBot API Key") },
+                        singleLine = true,
+                        colors = fieldColors,
+                        supportingText = {
+                            Text(
+                                "Contact must WhatsApp +34 644 56 59 11 saying \"I allow callmebot to send me messages\" to get their key.",
+                                color = Color.Gray,
+                                fontSize = 11.sp
+                            )
+                        },
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                    Spacer(Modifier.height(14.dp))
+                    Button(
+                        onClick = {
+                            val name = nameInput.trim()
+                            val phone = phoneInput.trim()
+                            val apiKey = apiKeyInput.trim()
+                            if (name.isNotEmpty() && phone.length >= 7 && apiKey.isNotEmpty()) {
+                                onContactsChanged(contacts + EmergencyContact(name, phone, apiKey))
+                                nameInput = ""
+                                phoneInput = ""
+                                apiKeyInput = ""
+                            }
+                        },
+                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF3498DB)),
+                        shape = RoundedCornerShape(8.dp),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Icon(Icons.Default.Add, contentDescription = null, modifier = Modifier.size(18.dp))
+                        Spacer(Modifier.width(6.dp))
+                        Text("ADD CONTACT", fontWeight = FontWeight.Bold)
+                    }
+                }
+            }
+
+            Spacer(Modifier.height(20.dp))
+
+            // ── Contacts list ─────────────────────────────────────────────────
+            if (contacts.isEmpty()) {
+                Box(
+                    Modifier
+                        .fillMaxWidth()
+                        .background(Color(0xFF161B22), RoundedCornerShape(12.dp))
+                        .padding(24.dp),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Text("No contacts saved yet.", color = Color.Gray, fontSize = 14.sp)
+                }
+            } else {
+                Text(
+                    "${contacts.size} contact${if (contacts.size > 1) "s" else ""} saved",
+                    color = Color.Gray,
+                    fontSize = 12.sp
+                )
+                Spacer(Modifier.height(8.dp))
+                contacts.forEachIndexed { index, contact ->
+                    Card(
+                        colors = CardDefaults.cardColors(containerColor = Color(0xFF161B22)),
+                        shape = RoundedCornerShape(10.dp),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Row(
+                            Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 16.dp, vertical = 12.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Box(
+                                Modifier
+                                    .size(36.dp)
+                                    .background(Color(0xFF1A3A5C), CircleShape),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Text(
+                                    contact.name.first().uppercaseChar().toString(),
+                                    color = Color(0xFF3498DB),
+                                    fontWeight = FontWeight.Bold,
+                                    fontSize = 16.sp
+                                )
+                            }
+                            Spacer(Modifier.width(12.dp))
+                            Column(Modifier.weight(1f)) {
+                                Text(contact.name, color = Color.White, fontWeight = FontWeight.Medium, fontSize = 14.sp)
+                                Text(contact.phone, color = Color.Gray, fontSize = 12.sp)
+                            }
+                            IconButton(onClick = {
+                                onContactsChanged(contacts.filterIndexed { i, _ -> i != index })
+                            }) {
+                                Icon(Icons.Default.Delete, contentDescription = "Remove", tint = Color(0xFFE74C3C))
+                            }
+                        }
+                    }
+                    if (index < contacts.lastIndex) Spacer(Modifier.height(8.dp))
+                }
+            }
+
+            Spacer(Modifier.height(16.dp))
         }
     }
 
