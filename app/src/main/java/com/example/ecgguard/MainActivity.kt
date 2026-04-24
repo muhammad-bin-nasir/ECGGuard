@@ -28,6 +28,9 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlin.math.abs
+import androidx.compose.animation.core.*
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.ui.text.style.TextAlign
 
 class MainActivity : ComponentActivity() {
 
@@ -59,6 +62,7 @@ class MainActivity : ComponentActivity() {
         var logs by remember { mutableStateOf("System Initialized.\nWaiting for user...") }
         var mseDisplay by remember { mutableStateOf("0.0000") }
         var latencyDisplay by remember { mutableStateOf("0 ms") }
+        var heartRateDisplay by remember { mutableStateOf("-- BPM") }
         var statusDisplay by remember { mutableStateOf("AWAITING CONNECTION") }
         var statusColor by remember { mutableStateOf(Color.DarkGray) }
 
@@ -126,12 +130,15 @@ class MainActivity : ComponentActivity() {
                     val tEnd = System.nanoTime()
                     val inferenceTimeMs = (tEnd - tStart) / 1_000_000.0
 
+                    val heartRate = SignalProcessor.calculateHeartRate(centeredData)
+
                     // --- UPDATE UI STATE ---
                     runOnUiThread {
                         isBuffering = false
                         mseDisplay = String.format("%.4f", finalMse)
                         latencyDisplay = String.format("%.1f ms", inferenceTimeMs)
-                        logs += "\n[Prediction] MSE: $mseDisplay | Structural: $isStructural"
+                        heartRateDisplay = if (heartRate in 30..220) "$heartRate BPM" else "-- BPM"
+                        logs += "\n[Prediction] MSE: $mseDisplay | HR: $heartRateDisplay | Structural: $isStructural"
 
                         // Extract the last 500 samples (2 seconds) for a clean visual plot
                         graphData = if (centeredData.size >= 500) {
@@ -176,7 +183,7 @@ class MainActivity : ComponentActivity() {
 
             // Screen Content
             if (currentScreen == "HOME") {
-                HomeScreen(statusDisplay, statusColor, mseDisplay, latencyDisplay, graphData, isBuffering)
+                HomeScreen(statusDisplay, statusColor, mseDisplay, latencyDisplay, heartRateDisplay, graphData, isBuffering)
             } else {
                 SettingsScreen(logs, { permissionLauncher.launch(permissionsToRequest) })
             }
@@ -187,50 +194,137 @@ class MainActivity : ComponentActivity() {
     fun HomeScreen(
         statusDisplay: String, statusColor: Color,
         mseDisplay: String, latencyDisplay: String,
+        heartRateDisplay: String,
         graphData: FloatArray, isBuffering: Boolean
     ) {
-        Column(modifier = Modifier.fillMaxSize().padding(16.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+        val scrollState = rememberScrollState()
 
-            // 1. STATUS BANNER
+        // Infinite blinking animation used for both the status dot and LIVE badge dot
+        val infiniteTransition = rememberInfiniteTransition(label = "status")
+        val dotAlpha by infiniteTransition.animateFloat(
+            initialValue = 0.25f, targetValue = 1.0f,
+            animationSpec = infiniteRepeatable(
+                animation = tween(700, easing = FastOutSlowInEasing),
+                repeatMode = RepeatMode.Reverse
+            ), label = "dot"
+        )
+
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .verticalScroll(scrollState)
+                .padding(16.dp),
+            horizontalAlignment = Alignment.CenterHorizontally
+        ) {
+            // ── 1. ANIMATED STATUS BANNER ─────────────────────────────────────
             Card(
                 colors = CardDefaults.cardColors(containerColor = statusColor),
-                shape = RoundedCornerShape(12.dp),
-                modifier = Modifier.fillMaxWidth().height(70.dp)
+                shape = RoundedCornerShape(16.dp),
+                elevation = CardDefaults.cardElevation(defaultElevation = 8.dp),
+                modifier = Modifier.fillMaxWidth().height(68.dp)
             ) {
-                Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                    Text(statusDisplay, fontSize = 20.sp, fontWeight = FontWeight.Black, color = Color.White, letterSpacing = 1.sp)
+                Row(
+                    Modifier.fillMaxSize().padding(horizontal = 24.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.Center
+                ) {
+                    Box(
+                        Modifier
+                            .size(8.dp)
+                            .background(Color.White.copy(alpha = dotAlpha), CircleShape)
+                    )
+                    Spacer(Modifier.width(12.dp))
+                    Text(
+                        statusDisplay,
+                        fontSize = 17.sp,
+                        fontWeight = FontWeight.Black,
+                        color = Color.White,
+                        letterSpacing = 2.sp
+                    )
                 }
             }
 
-            Spacer(Modifier.height(24.dp))
+            Spacer(Modifier.height(14.dp))
 
-            // 2. LIVE ECG PLOT
-            Card(
-                colors = CardDefaults.cardColors(containerColor = Color(0xFF000000)),
-                shape = RoundedCornerShape(12.dp),
-                modifier = Modifier.fillMaxWidth().height(250.dp)
-            ) {
-                Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                    if (isBuffering) {
-                        Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                            CircularProgressIndicator(color = Color(0xFF2ECC71))
-                            Spacer(Modifier.height(16.dp))
-                            Text("Filling 10-Second Buffer...", color = Color.Gray)
+            // ── 2. LIVE ECG CHART ─────────────────────────────────────────────
+            Box(Modifier.fillMaxWidth()) {
+                Card(
+                    colors = CardDefaults.cardColors(containerColor = Color(0xFF020A02)),
+                    shape = RoundedCornerShape(16.dp),
+                    elevation = CardDefaults.cardElevation(defaultElevation = 4.dp),
+                    modifier = Modifier.fillMaxWidth().height(230.dp)
+                ) {
+                    Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                        if (isBuffering) {
+                            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                                CircularProgressIndicator(
+                                    color = Color(0xFF39FF14),
+                                    strokeWidth = 3.dp
+                                )
+                                Spacer(Modifier.height(14.dp))
+                                Text(
+                                    "Filling 10-Second Buffer…",
+                                    color = Color(0xFF39FF14).copy(alpha = 0.7f),
+                                    fontSize = 13.sp
+                                )
+                            }
+                        } else {
+                            ECGChart(graphData)
                         }
-                    } else {
-                        ECGChart(graphData)
+                    }
+                }
+                // Blinking LIVE badge (top-right corner of chart)
+                if (!isBuffering) {
+                    Card(
+                        colors = CardDefaults.cardColors(containerColor = Color(0xFFCC2200)),
+                        shape = RoundedCornerShape(6.dp),
+                        modifier = Modifier
+                            .align(Alignment.TopEnd)
+                            .padding(top = 10.dp, end = 10.dp)
+                    ) {
+                        Row(
+                            Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Box(
+                                Modifier
+                                    .size(5.dp)
+                                    .background(Color.White.copy(alpha = dotAlpha), CircleShape)
+                            )
+                            Spacer(Modifier.width(5.dp))
+                            Text("LIVE", fontSize = 10.sp, fontWeight = FontWeight.Bold, color = Color.White)
+                        }
                     }
                 }
             }
 
-            Spacer(Modifier.height(24.dp))
+            Spacer(Modifier.height(12.dp))
 
-            // 3. AI METRICS
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                MetricCard("Mean Squared Error", mseDisplay, modifier = Modifier.weight(1f))
-                Spacer(Modifier.width(16.dp))
-                MetricCard("Inference Latency", latencyDisplay, modifier = Modifier.weight(1f))
+            // ── 3. HEART RATE CARD ────────────────────────────────────────────
+            HeartRateCard(heartRateDisplay)
+
+            Spacer(Modifier.height(12.dp))
+
+            // ── 4. AI METRICS ROW ─────────────────────────────────────────────
+            Row(
+                Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                MetricCard(
+                    title = "Recon. Error (MSE)",
+                    value = mseDisplay,
+                    accentColor = Color(0xFF3498DB),
+                    modifier = Modifier.weight(1f)
+                )
+                MetricCard(
+                    title = "AI Latency",
+                    value = latencyDisplay,
+                    accentColor = Color(0xFF9B59B6),
+                    modifier = Modifier.weight(1f)
+                )
             }
+
+            Spacer(Modifier.height(4.dp))
         }
     }
 
@@ -241,35 +335,94 @@ class MainActivity : ComponentActivity() {
         Canvas(modifier = Modifier.fillMaxSize().padding(8.dp)) {
             val width = size.width
             val height = size.height
+            val majorGrid = Color(0xFF003300)
+            val minorGrid = Color(0xFF001500)
 
-            // Draw Background Grid (Simulating ECG Paper)
-            val gridPaint = Color(0xFF003300)
+            // Fine ECG-paper grid (20 columns, 10 rows; every 2nd line is major)
+            for (i in 0..20) {
+                val x = width * (i / 20f)
+                drawLine(if (i % 2 == 0) majorGrid else minorGrid, Offset(x, 0f), Offset(x, height), strokeWidth = 0.6f)
+            }
             for (i in 0..10) {
                 val y = height * (i / 10f)
-                drawLine(gridPaint, Offset(0f, y), Offset(width, y), strokeWidth = 1f)
-                val x = width * (i / 10f)
-                drawLine(gridPaint, Offset(x, 0f), Offset(x, height), strokeWidth = 1f)
+                drawLine(if (i % 2 == 0) majorGrid else minorGrid, Offset(0f, y), Offset(width, y), strokeWidth = 0.6f)
             }
+            // Subtle centre baseline
+            drawLine(Color(0xFF005000), Offset(0f, height / 2f), Offset(width, height / 2f), strokeWidth = 1f)
 
-            // Scale data to fit Canvas
+            // Scale data, leaving 5 % margin top & bottom
             val maxVal = data.maxOrNull() ?: 1f
             val minVal = data.minOrNull() ?: -1f
-            val range = (maxVal - minVal).coerceAtLeast(0.1f) // Prevent div by zero
+            val range = (maxVal - minVal).coerceAtLeast(0.1f)
 
             val path = Path()
-            val stepX = width / (data.size - 1)
+            val stepX = width / (data.size - 1).coerceAtLeast(1)
 
             data.forEachIndexed { index, value ->
                 val x = index * stepX
-                // Normalize Y to canvas height (inverted because Y grows downwards)
                 val normalizedY = (value - minVal) / range
-                val y = height - (normalizedY * height)
-
+                val y = height - (normalizedY * height * 0.90f) - (height * 0.05f)
                 if (index == 0) path.moveTo(x, y) else path.lineTo(x, y)
             }
 
-            // Draw the neon green ECG line
-            drawPath(path = path, color = Color(0xFF00FF00), style = Stroke(width = 3f))
+            // Neon-green glow: three layered strokes (outer → core)
+            val ecgColor = Color(0xFF39FF14)
+            drawPath(path, ecgColor.copy(alpha = 0.07f), style = Stroke(width = 16f))
+            drawPath(path, ecgColor.copy(alpha = 0.18f), style = Stroke(width = 8f))
+            drawPath(path, ecgColor.copy(alpha = 0.55f), style = Stroke(width = 3.5f))
+            drawPath(path, ecgColor,                    style = Stroke(width = 1.8f))
+        }
+    }
+
+    @Composable
+    fun HeartRateCard(heartRate: String) {
+        val bpm = heartRate.substringBefore(" BPM").toIntOrNull() ?: 0
+        val hrColor = when {
+            bpm == 0      -> Color(0xFF5A6272)
+            bpm < 50 || bpm > 130 -> Color(0xFFE74C3C)
+            bpm < 60 || bpm > 100 -> Color(0xFFF39C12)
+            else          -> Color(0xFF2ECC71)
+        }
+        val hrLabel = when {
+            bpm == 0   -> "NO DATA"
+            bpm < 50   -> "BRADYCARDIA"
+            bpm > 130  -> "TACHYCARDIA"
+            bpm < 60   -> "LOW NORMAL"
+            bpm > 100  -> "ELEVATED"
+            else       -> "NORMAL"
+        }
+
+        Card(
+            colors = CardDefaults.cardColors(containerColor = Color(0xFF161B22)),
+            shape = RoundedCornerShape(12.dp),
+            modifier = Modifier.fillMaxWidth().height(90.dp)
+        ) {
+            Row(
+                Modifier.fillMaxSize().padding(horizontal = 20.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                Column {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Box(Modifier.size(4.dp).background(hrColor, CircleShape))
+                        Spacer(Modifier.width(6.dp))
+                        Text("HEART RATE", color = Color.Gray, fontSize = 11.sp, fontWeight = FontWeight.Medium)
+                    }
+                    Spacer(Modifier.height(6.dp))
+                    Text(heartRate, color = hrColor, fontSize = 26.sp, fontWeight = FontWeight.Bold)
+                }
+                Column(horizontalAlignment = Alignment.End) {
+                    Text("Normal: 60\u2013100 BPM", color = Color.Gray, fontSize = 10.sp)
+                    Spacer(Modifier.height(6.dp))
+                    Box(
+                        Modifier
+                            .background(hrColor.copy(alpha = 0.15f), RoundedCornerShape(8.dp))
+                            .padding(horizontal = 10.dp, vertical = 5.dp)
+                    ) {
+                        Text(hrLabel, color = hrColor, fontSize = 11.sp, fontWeight = FontWeight.SemiBold)
+                    }
+                }
+            }
         }
     }
 
@@ -308,16 +461,20 @@ class MainActivity : ComponentActivity() {
     }
 
     @Composable
-    fun MetricCard(title: String, value: String, modifier: Modifier = Modifier) {
+    fun MetricCard(title: String, value: String, accentColor: Color = Color(0xFF3498DB), modifier: Modifier = Modifier) {
         Card(
             colors = CardDefaults.cardColors(containerColor = Color(0xFF161B22)),
             shape = RoundedCornerShape(12.dp),
-            modifier = modifier.height(100.dp)
+            modifier = modifier.height(90.dp)
         ) {
             Column(Modifier.padding(16.dp).fillMaxSize(), verticalArrangement = Arrangement.Center) {
-                Text(title, color = Color.Gray, fontSize = 12.sp, fontWeight = FontWeight.Medium)
-                Spacer(Modifier.height(4.dp))
-                Text(value, color = Color.White, fontSize = 24.sp, fontWeight = FontWeight.Bold)
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Box(Modifier.size(4.dp).background(accentColor, CircleShape))
+                    Spacer(Modifier.width(6.dp))
+                    Text(title, color = Color.Gray, fontSize = 11.sp, fontWeight = FontWeight.Medium)
+                }
+                Spacer(Modifier.height(6.dp))
+                Text(value, color = Color.White, fontSize = 21.sp, fontWeight = FontWeight.Bold)
             }
         }
     }
@@ -421,5 +578,40 @@ object SignalProcessor {
             return errorInQrs > errorTotal
         }
         return false
+    }
+
+    /**
+     * Estimates heart rate (BPM) by detecting R-peaks in the centered ECG signal.
+     * Uses a local-maximum threshold approach with a 300 ms refractory period.
+     * @param signal  Mean-centered ECG window (2500 samples at 250 Hz = 10 s)
+     * @param sampleRate  Sampling frequency in Hz (default 250)
+     * @return Heart rate in BPM, or 0 if detection failed
+     */
+    fun calculateHeartRate(signal: FloatArray, sampleRate: Int = 250): Int {
+        if (signal.size < sampleRate) return 0
+
+        val maxVal = signal.maxOrNull() ?: return 0
+        if (maxVal <= 0f) return 0
+
+        // Threshold: 55 % of the tallest R-peak amplitude
+        val threshold = maxVal * 0.55f
+        // Minimum R-R distance: 300 ms → 75 samples (caps at ~200 BPM)
+        val minPeakDist = (sampleRate * 0.30f).toInt()
+
+        var peakCount = 0
+        var lastPeakIdx = -minPeakDist
+
+        for (i in 1 until signal.size - 1) {
+            if (signal[i] > threshold &&
+                signal[i] >= signal[i - 1] &&
+                signal[i] >= signal[i + 1] &&
+                (i - lastPeakIdx) >= minPeakDist) {
+                peakCount++
+                lastPeakIdx = i
+            }
+        }
+
+        val durationSec = signal.size.toFloat() / sampleRate
+        return if (peakCount > 0) ((peakCount.toFloat() / durationSec) * 60f).toInt() else 0
     }
 }
