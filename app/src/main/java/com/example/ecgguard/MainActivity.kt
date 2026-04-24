@@ -7,8 +7,6 @@ import android.location.LocationManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
-import java.net.HttpURLConnection
-import java.net.URL
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
@@ -67,27 +65,21 @@ class MainActivity : ComponentActivity() {
             }
         } catch (e: Exception) { /* ignore */ }
 
-        val text = "ECGGuard ALERT: Cardiac anomaly detected! Immediate attention may be needed. Location: $locationText"
+        val text = "ECGGuard ALERT: Cardiac anomaly detected! " +
+            "Immediate attention may be needed. Location: $locationText"
 
-        // CallMeBot free WhatsApp API — no paid plan needed.
-        // Each contact must activate it once by messaging +34 644 56 59 11 on WhatsApp:
-        //   "I allow callmebot to send me messages"
-        // then saving the API key they receive.
+        // Opens WhatsApp for each contact with the message pre-filled.
+        // The contact just taps Send — no API key required.
         contacts.forEach { contact ->
-            if (contact.apiKey.isBlank()) return@forEach
-            Thread {
-                try {
-                    val encoded = java.net.URLEncoder.encode(text, "UTF-8")
-                    val urlStr = "https://api.callmebot.com/whatsapp.php" +
-                        "?phone=${contact.phone}&text=$encoded&apikey=${contact.apiKey}"
-                    val conn = URL(urlStr).openConnection() as HttpURLConnection
-                    conn.requestMethod = "GET"
-                    conn.connectTimeout = 10_000
-                    conn.readTimeout = 10_000
-                    conn.responseCode  // execute
-                    conn.disconnect()
-                } catch (e: Exception) { /* network error */ }
-            }.start()
+            try {
+                val phone = contact.phone.replace(Regex("[^0-9]"), "")
+                val encoded = java.net.URLEncoder.encode(text, "UTF-8")
+                val uri = Uri.parse("https://wa.me/$phone?text=$encoded")
+                val intent = Intent(Intent.ACTION_VIEW, uri).apply {
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                }
+                startActivity(intent)
+            } catch (e: Exception) { /* WhatsApp not installed */ }
         }
     }
 
@@ -214,15 +206,11 @@ class MainActivity : ComponentActivity() {
                     val centeredData = FloatArray(cleanData.size) { i -> cleanData[i] - mu }
 
                     var finalMse = 0f
-                    var isStructural = true
 
                     if (model != null) {
                         try {
-                            val (rawMse, reconstructedData) = model!!.runInference(centeredData)
-                            isStructural = SignalProcessor.checkStructuralError(centeredData, reconstructedData, rawMse)
-                            // Suppress MSE only when the high error is caused by a structural/lead
-                            // artifact (isStructural=true), NOT when it is a genuine cardiac anomaly.
-                            finalMse = if (rawMse > 0.30f && isStructural) 0.0f else rawMse
+                            val (rawMse, _) = model!!.runInference(centeredData)
+                            finalMse = rawMse
                         } catch (e: Exception) {
                             logs += "\nModel Error: ${e.message}"
                         }
@@ -239,7 +227,7 @@ class MainActivity : ComponentActivity() {
                         mseDisplay = String.format("%.4f", finalMse)
                         latencyDisplay = String.format("%.1f ms", inferenceTimeMs)
                         heartRateDisplay = if (heartRate in 30..220) "$heartRate BPM" else "-- BPM"
-                        logs += "\n[Prediction] MSE: $mseDisplay | HR: $heartRateDisplay | Structural: $isStructural"
+                        logs += "\n[Prediction] MSE: $mseDisplay | HR: $heartRateDisplay"
 
                         // Extract the last 500 samples (2 seconds) for a clean visual plot
                         graphData = if (centeredData.size >= 500) {
@@ -599,7 +587,6 @@ class MainActivity : ComponentActivity() {
     ) {
         var nameInput by remember { mutableStateOf("") }
         var phoneInput by remember { mutableStateOf("") }
-        var apiKeyInput by remember { mutableStateOf("") }
         val scrollState = rememberScrollState()
         val fieldColors = OutlinedTextFieldDefaults.colors(
             focusedBorderColor = Color(0xFF3498DB),
@@ -654,29 +641,13 @@ class MainActivity : ComponentActivity() {
                     OutlinedTextField(
                         value = phoneInput,
                         onValueChange = { phoneInput = it },
-                        label = { Text("WhatsApp Number (e.g. +923001234567)") },
+                        label = { Text("WhatsApp Number") },
                         singleLine = true,
                         keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Phone),
                         colors = fieldColors,
                         supportingText = {
                             Text(
-                                "International format with + prefix.",
-                                color = Color.Gray,
-                                fontSize = 11.sp
-                            )
-                        },
-                        modifier = Modifier.fillMaxWidth()
-                    )
-                    Spacer(Modifier.height(10.dp))
-                    OutlinedTextField(
-                        value = apiKeyInput,
-                        onValueChange = { apiKeyInput = it },
-                        label = { Text("CallMeBot API Key") },
-                        singleLine = true,
-                        colors = fieldColors,
-                        supportingText = {
-                            Text(
-                                "Contact must WhatsApp +34 644 56 59 11 saying \"I allow callmebot to send me messages\" to get their key.",
+                                "International format, e.g. +923001234567",
                                 color = Color.Gray,
                                 fontSize = 11.sp
                             )
@@ -688,12 +659,10 @@ class MainActivity : ComponentActivity() {
                         onClick = {
                             val name = nameInput.trim()
                             val phone = phoneInput.trim()
-                            val apiKey = apiKeyInput.trim()
-                            if (name.isNotEmpty() && phone.length >= 7 && apiKey.isNotEmpty()) {
-                                onContactsChanged(contacts + EmergencyContact(name, phone, apiKey))
+                            if (name.isNotEmpty() && phone.length >= 7) {
+                                onContactsChanged(contacts + EmergencyContact(name, phone))
                                 nameInput = ""
                                 phoneInput = ""
-                                apiKeyInput = ""
                             }
                         },
                         colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF3498DB)),

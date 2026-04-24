@@ -4,7 +4,7 @@ import android.content.Context
 import org.json.JSONArray
 import org.json.JSONObject
 
-data class EmergencyContact(val name: String, val phone: String, val apiKey: String = "")
+data class EmergencyContact(val name: String, val phone: String)
 
 object EmergencyContactStore {
     private const val PREF_NAME = "ecg_prefs"
@@ -17,11 +17,7 @@ object EmergencyContactStore {
             val arr = JSONArray(json)
             (0 until arr.length()).map {
                 val obj = arr.getJSONObject(it)
-                EmergencyContact(
-                    obj.getString("name"),
-                    obj.getString("phone"),
-                    obj.optString("apiKey", "")
-                )
+                EmergencyContact(obj.getString("name"), obj.getString("phone"))
             }
         } catch (e: Exception) {
             emptyList()
@@ -34,7 +30,6 @@ object EmergencyContactStore {
             arr.put(JSONObject().apply {
                 put("name", it.name)
                 put("phone", it.phone)
-                put("apiKey", it.apiKey)
             })
         }
         context.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
