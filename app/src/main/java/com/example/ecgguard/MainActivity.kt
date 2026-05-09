@@ -788,6 +788,17 @@ class MainActivity : ComponentActivity() {
     @Composable
     fun PatientNameScreen(onSave: (String) -> Unit) {
         var name by remember { mutableStateOf("") }
+        val nameFieldColors = OutlinedTextFieldDefaults.colors(
+            focusedBorderColor = uiAccent,
+            unfocusedBorderColor = uiStroke,
+            focusedLabelColor = Color.White,
+            unfocusedLabelColor = Color.White,
+            focusedTextColor = Color.White,
+            unfocusedTextColor = Color.White,
+            cursorColor = uiAccent,
+            focusedPlaceholderColor = Color.White.copy(alpha = 0.7f),
+            unfocusedPlaceholderColor = Color.White.copy(alpha = 0.7f)
+        )
         Column(
             modifier = Modifier
                 .fillMaxSize()
@@ -799,15 +810,15 @@ class MainActivity : ComponentActivity() {
         ) {
             Text("Patient Name", color = uiAccent, fontSize = 13.sp, fontWeight = FontWeight.Bold)
             Spacer(Modifier.height(18.dp))
-            Text("Please enter the patient's name to use in emergency alerts.", color = uiTextMuted, fontSize = 14.sp, textAlign = TextAlign.Center)
+            Text("Please enter the patient's name to use in emergency alerts.", color = Color.White, fontSize = 14.sp, textAlign = TextAlign.Center)
             Spacer(Modifier.height(18.dp))
             OutlinedTextField(
                 value = name,
                 onValueChange = { name = it },
-                placeholder = { Text("Full name") },
+                placeholder = { Text("Full name", color = Color.White.copy(alpha = 0.7f)) },
                 singleLine = true,
                 modifier = Modifier.fillMaxWidth(),
-                colors = OutlinedTextFieldDefaults.colors()
+                colors = nameFieldColors
             )
             Spacer(Modifier.height(18.dp))
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
@@ -1292,7 +1303,7 @@ class MainActivity : ComponentActivity() {
                         supportingText = {
                             Text(
                                 "International format, e.g. +923001234567",
-                                color = Color.Gray,
+                                color = Color.White,
                                 fontSize = 11.sp
                             )
                         },
@@ -1331,12 +1342,12 @@ class MainActivity : ComponentActivity() {
                         .padding(24.dp),
                     contentAlignment = Alignment.Center
                 ) {
-                    Text("No contacts saved yet.", color = Color.Gray, fontSize = 14.sp)
+                    Text("No contacts saved yet.", color = Color.White, fontSize = 14.sp)
                 }
             } else {
                 Text(
                     "${contacts.size} contact${if (contacts.size > 1) "s" else ""} saved",
-                    color = Color.Gray,
+                    color = Color.White,
                     fontSize = 12.sp
                 )
                 Spacer(Modifier.height(8.dp))
@@ -1368,7 +1379,7 @@ class MainActivity : ComponentActivity() {
                             Spacer(Modifier.width(12.dp))
                             Column(Modifier.weight(1f)) {
                                 Text(contact.name, color = Color.White, fontWeight = FontWeight.Medium, fontSize = 14.sp)
-                                Text(contact.phone, color = Color.Gray, fontSize = 12.sp)
+                                Text(contact.phone, color = Color.White, fontSize = 12.sp)
                             }
                             IconButton(onClick = {
                                 onContactsChanged(contacts.filterIndexed { i, _ -> i != index })
@@ -1435,13 +1446,13 @@ class MainActivity : ComponentActivity() {
                                 .size((14f * heartScale).dp)
                         )
                         Spacer(Modifier.width(6.dp))
-                        Text("HEART RATE", color = Color.Gray, fontSize = 11.sp, fontWeight = FontWeight.Medium)
+                        Text("HEART RATE", color = Color.White, fontSize = 11.sp, fontWeight = FontWeight.Medium)
                     }
                     Spacer(Modifier.height(6.dp))
                     Text(heartRate, color = hrColor, fontSize = 26.sp, fontWeight = FontWeight.Bold)
                 }
                 Column(horizontalAlignment = Alignment.End) {
-                    Text("Normal: 60\u2013100 BPM", color = Color.Gray, fontSize = 10.sp)
+                    Text("Normal: 60\u2013100 BPM", color = Color.White, fontSize = 10.sp)
                     Spacer(Modifier.height(6.dp))
                     Box(
                         Modifier
@@ -1478,13 +1489,23 @@ class MainActivity : ComponentActivity() {
         onConnect: () -> Unit
     ) {
         val scrollState = rememberScrollState()
+        val patientFieldColors = OutlinedTextFieldDefaults.colors(
+            focusedBorderColor = uiAccent,
+            unfocusedBorderColor = uiStroke,
+            focusedLabelColor = Color.White,
+            unfocusedLabelColor = Color.White,
+            focusedTextColor = Color.White,
+            unfocusedTextColor = Color.White,
+            cursorColor = uiAccent
+        )
 
-        Column(modifier = Modifier.fillMaxSize().padding(16.dp)) {
+        Column(modifier = Modifier.fillMaxSize().verticalScroll(scrollState).padding(16.dp)) {
+            Spacer(Modifier.height(18.dp))
             // Patient identity card
             Card(
                 colors = CardDefaults.cardColors(containerColor = uiPanel),
                 shape = RoundedCornerShape(12.dp),
-                modifier = Modifier.fillMaxWidth()
+                modifier = Modifier.fillMaxWidth().padding(bottom = 20.dp)
             ) {
                 var showEdit by remember { mutableStateOf(false) }
                 var tempName by remember { mutableStateOf(patientName) }
@@ -1493,7 +1514,7 @@ class MainActivity : ComponentActivity() {
                         Column(Modifier.weight(1f)) {
                             Text("Patient", color = Color.White, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
                             Spacer(Modifier.height(4.dp))
-                            Text(if (patientName.isBlank()) "(not set)" else patientName, color = Color.Gray, fontSize = 13.sp)
+                            Text(if (patientName.isBlank()) "(not set)" else patientName, color = Color.White, fontSize = 13.sp)
                         }
                         IconButton(onClick = { tempName = patientName; showEdit = true }) {
                             Icon(Icons.Default.Person, contentDescription = "Edit patient name", tint = uiAccent)
@@ -1511,7 +1532,8 @@ class MainActivity : ComponentActivity() {
                                 onValueChange = { tempName = it },
                                 singleLine = true,
                                 modifier = Modifier.fillMaxWidth(),
-                                colors = OutlinedTextFieldDefaults.colors()
+                                colors = patientFieldColors,
+                                textStyle = androidx.compose.ui.text.TextStyle(color = Color.White)
                             )
                         },
                         confirmButton = {
@@ -1526,7 +1548,7 @@ class MainActivity : ComponentActivity() {
 
             Text("Device Connectivity", fontSize = 20.sp, fontWeight = FontWeight.Bold, color = Color.White)
             Spacer(Modifier.height(4.dp))
-            Text("Configure alerts, diagnostics, and background mode.", color = uiTextMuted, fontSize = 12.sp)
+            Text("Configure alerts, diagnostics, and background mode.", color = Color.White, fontSize = 12.sp)
             Spacer(Modifier.height(16.dp))
 
             Card(
@@ -1541,8 +1563,8 @@ class MainActivity : ComponentActivity() {
                     Column(Modifier.weight(1f)) {
                         Text(if (connected) "Connected" else "Disconnected", color = Color.White, fontSize = 16.sp, fontWeight = FontWeight.Bold)
                         Spacer(Modifier.height(4.dp))
-                        Text(deviceName, color = Color.Gray, fontSize = 12.sp)
-                        Text("Last seen: $lastSeen", color = Color.Gray, fontSize = 11.sp)
+                        Text(deviceName, color = Color.White, fontSize = 12.sp)
+                        Text("Last seen: $lastSeen", color = Color.White, fontSize = 11.sp)
                     }
                     Spacer(Modifier.width(8.dp))
                     Button(onClick = onConnect, colors = ButtonDefaults.buttonColors(containerColor = uiAccent), shape = RoundedCornerShape(8.dp)) {
@@ -1561,13 +1583,13 @@ class MainActivity : ComponentActivity() {
                 Column(Modifier.padding(horizontal = 16.dp, vertical = 14.dp)) {
                     Text("Background Monitoring", color = Color.White, fontWeight = FontWeight.SemiBold, fontSize = 14.sp)
                     Spacer(Modifier.height(6.dp))
-                    Text(
-                        if (backgroundMonitoringEnabled) "Running in foreground service. You can lock screen and keep monitoring."
-                        else "Start service to keep BLE monitoring active when the app is in background.",
-                        color = Color.Gray,
-                        fontSize = 12.sp,
-                        lineHeight = 18.sp
-                    )
+                        Text(
+                            if (backgroundMonitoringEnabled) "Running in foreground service. You can lock screen and keep monitoring."
+                            else "Start service to keep BLE monitoring active when the app is in background.",
+                            color = Color.White,
+                            fontSize = 12.sp,
+                            lineHeight = 18.sp
+                        )
                     Spacer(Modifier.height(12.dp))
                     Row(horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.fillMaxWidth()) {
                         Button(
@@ -1604,7 +1626,7 @@ class MainActivity : ComponentActivity() {
 
                     Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
                         Column(Modifier.weight(1f)) {
-                            Text("Threshold", color = Color.Gray, fontSize = 11.sp)
+                            Text("Threshold", color = Color.White, fontSize = 11.sp)
                             Text("$bradyThreshold BPM", color = uiAccentAlt, fontSize = 18.sp, fontWeight = FontWeight.Bold)
                         }
                         Spacer(Modifier.width(8.dp))
@@ -1631,7 +1653,7 @@ class MainActivity : ComponentActivity() {
 
                     Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
                         Column(Modifier.weight(1f)) {
-                            Text("Alarm Volume", color = Color.Gray, fontSize = 11.sp)
+                            Text("Alarm Volume", color = Color.White, fontSize = 11.sp)
                             Text("$bradyAlarmVolume %", color = uiAccent, fontSize = 18.sp, fontWeight = FontWeight.Bold)
                         }
                     }
@@ -1649,7 +1671,7 @@ class MainActivity : ComponentActivity() {
             Spacer(Modifier.height(16.dp))
 
             Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                Text("Advanced diagnostics", color = Color.Gray, fontSize = 14.sp, modifier = Modifier.weight(1f))
+                Text("Advanced diagnostics", color = Color.White, fontSize = 14.sp, modifier = Modifier.weight(1f))
                 Switch(checked = showAdvanced, onCheckedChange = { onToggleAdvanced() }, colors = SwitchDefaults.colors(checkedThumbColor = uiAccent))
             }
 
@@ -1666,7 +1688,7 @@ class MainActivity : ComponentActivity() {
                 }
                 if (exportStatus.isNotBlank()) {
                     Spacer(Modifier.height(8.dp))
-                    Text(exportStatus, color = Color.Gray, fontSize = 11.sp, lineHeight = 16.sp)
+                    Text(exportStatus, color = Color.White, fontSize = 11.sp, lineHeight = 16.sp)
                 }
                 Spacer(Modifier.height(12.dp))
                 Box(
@@ -1681,7 +1703,7 @@ class MainActivity : ComponentActivity() {
                 }
             } else {
                 Spacer(Modifier.height(12.dp))
-                Text("Tip: Toggle to view low-level BLE logs.", color = Color.Gray, fontSize = 12.sp)
+                Text("Tip: Toggle to view low-level BLE logs.", color = Color.White, fontSize = 12.sp)
             }
         }
     }
