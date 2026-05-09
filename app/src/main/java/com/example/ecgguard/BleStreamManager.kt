@@ -135,7 +135,12 @@ class BleStreamManager(
                 cancelScanTimeout()
                 stopScanSafely()
                 log("TARGET FOUND ($name)! Connecting...")
-                gatt = device.connectGatt(context, false, gattCallback)
+                gatt = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                    device.connectGatt(context, false, gattCallback, BluetoothDevice.TRANSPORT_LE)
+                } else {
+                    @Suppress("DEPRECATION")
+                    device.connectGatt(context, false, gattCallback)
+                }
             }
         }
 

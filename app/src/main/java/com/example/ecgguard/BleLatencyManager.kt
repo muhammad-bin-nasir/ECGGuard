@@ -70,7 +70,12 @@ class BleLatencyManager(private val context: Context, private val onLog: (String
 
                 scanTimeoutRunnable?.let { scanTimeoutHandler.removeCallbacks(it) }
                 adapter.bluetoothLeScanner.stopScan(this)
-                device.connectGatt(context, false, gattCallback)
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                    device.connectGatt(context, false, gattCallback, BluetoothDevice.TRANSPORT_LE)
+                } else {
+                    @Suppress("DEPRECATION")
+                    device.connectGatt(context, false, gattCallback)
+                }
             }
         }
     }
