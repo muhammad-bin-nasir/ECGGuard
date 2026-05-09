@@ -2,11 +2,18 @@ package com.example.ecgguard
 
 import android.Manifest
 import android.annotation.SuppressLint
+import android.app.ActivityManager
+import android.content.Context
 import android.content.Intent
 import android.location.LocationManager
+import android.media.AudioManager
+import android.media.ToneGenerator
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.VibrationEffect
+import android.os.Vibrator
+import android.util.Log
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
@@ -22,6 +29,8 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.Favorite
+import androidx.compose.material.icons.filled.Home
 import androidx.compose.material.icons.filled.Person
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Warning
@@ -30,6 +39,7 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.drawscope.Stroke
@@ -41,12 +51,64 @@ import kotlin.math.abs
 import androidx.compose.animation.core.*
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.platform.LocalContext
+import androidx.core.content.ContextCompat
 import kotlinx.coroutines.delay
+import java.io.File
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+import kotlin.math.PI
+import kotlin.math.cos
+import kotlin.math.sqrt
 
 class MainActivity : ComponentActivity() {
 
     private var streamManager: BleStreamManager? = null
     private var model: ECGModel? = null
+
+    @Suppress("DEPRECATION")
+    private fun isBackgroundMonitoringServiceRunning(): Boolean {
+        val manager = getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
+        return manager.getRunningServices(Int.MAX_VALUE)
+            .any { it.service.className == BackgroundMonitoringService::class.java.name }
+    }
+
+    // App-wide dark palette (plum/brown family) for a cohesive visual language.
+    private val uiBgTop = Color(0xFF23141F)
+    private val uiBgMid = Color(0xFF2B1823)
+    private val uiBgBottom = Color(0xFF2E1F1B)
+    private val uiPanel = Color(0xFF3A2532)
+    private val uiPanelAlt = Color(0xFF4A2E3D)
+    private val uiStroke = Color(0xFF6A4357)
+    private val uiAccent = Color(0xFFE879A8)
+    private val uiAccentAlt = Color(0xFFCC936C)
+    private val uiTextMuted = Color(0xFFC0AFC0)
+
+    private fun exportRrIntervalsCsv(rrMs: FloatArray): String? {
+        if (rrMs.isEmpty()) return null
+        return try {
+            val dir = File(getExternalFilesDir(null), "exports").apply { mkdirs() }
+            val fileName = "rr_intervals_${SimpleDateFormat("yyyyMMdd_HHmmss", Locale.getDefault()).format(Date())}.csv"
+            val file = File(dir, fileName)
+
+            val content = buildString {
+                appendLine("index,rr_ms,beat_time_s,inst_hr_bpm")
+                var elapsedMs = 0f
+                rrMs.forEachIndexed { idx, rr ->
+                    elapsedMs += rr
+                    val hr = if (rr > 0f) 60000f / rr else 0f
+                    appendLine(
+                        "${idx + 1},${String.format(Locale.US, "%.2f", rr)},${String.format(Locale.US, "%.2f", elapsedMs / 1000f)},${String.format(Locale.US, "%.1f", hr)}"
+                    )
+                }
+            }
+            file.writeText(content)
+            file.absolutePath
+        } catch (_: Exception) {
+            null
+        }
+    }
 
     @SuppressLint("MissingPermission")
     private fun sendWhatsAppAlerts(contacts: List<EmergencyContact>) {
@@ -93,7 +155,7 @@ class MainActivity : ComponentActivity() {
 
         setContent {
             MaterialTheme {
-                Surface(color = Color(0xFF0D1117), contentColor = Color.White) {
+                Surface(color = uiBgTop, contentColor = Color.White) {
                     MainApp()
                 }
             }
@@ -103,12 +165,34 @@ class MainActivity : ComponentActivity() {
     @Composable
     fun MainApp() {
         // --- SHARED STATE ---
+        val prefs = remember { getSharedPreferences(BackgroundMonitoringService.PREFS_NAME, Context.MODE_PRIVATE) }
+        var onboardingDone by remember { mutableStateOf(prefs.getBoolean("onboarding_done", false)) }
         var currentScreen by remember { mutableStateOf("HOME") }
+        var backgroundMonitoringEnabled by remember {
+            mutableStateOf(prefs.getBoolean(BackgroundMonitoringService.KEY_BG_MONITORING_ENABLED, false))
+        }
 
         var logs by remember { mutableStateOf("System Initialized.\nWaiting for user...") }
+        // BLE-only logs and connection state (keeps model/test output out of Settings)
+        var bleLogs by remember { mutableStateOf("") }
+        var deviceConnected by remember { mutableStateOf(false) }
+        var connectedDeviceName by remember { mutableStateOf("\u2014") }
+        var lastSeen by remember { mutableStateOf("\u2014") }
+        var showAdvancedLogs by remember { mutableStateOf(false) }
         var mseDisplay by remember { mutableStateOf("0.0000") }
         var latencyDisplay by remember { mutableStateOf("0 ms") }
         var heartRateDisplay by remember { mutableStateOf("-- BPM") }
+        var hrTrendDisplay by remember { mutableStateOf("--") }
+        var sdnnDisplay by remember { mutableStateOf("-- ms") }
+        var rmssdDisplay by remember { mutableStateOf("-- ms") }
+        var pnn50Display by remember { mutableStateOf("-- %") }
+        var dominantFreqDisplay by remember { mutableStateOf("-- Hz") }
+        var qualityDisplay by remember { mutableStateOf("--") }
+        var rPeakDisplay by remember { mutableStateOf("--") }
+        var qrsDisplay by remember { mutableStateOf("--") }
+        var heartRateHistory by remember { mutableStateOf(IntArray(0)) }
+        var rrIntervalsForExport by remember { mutableStateOf(FloatArray(0)) }
+        var exportStatus by remember { mutableStateOf("") }
         var statusDisplay by remember { mutableStateOf("AWAITING CONNECTION") }
         var statusColor by remember { mutableStateOf(Color.DarkGray) }
 
@@ -120,7 +204,29 @@ class MainActivity : ComponentActivity() {
         var showAnomalyDialog by remember { mutableStateOf(false) }
         var anomalyEpisodeHandled by remember { mutableStateOf(false) }
         var countdownSeconds by remember { mutableStateOf(10) }
+        // --- BRADYCARDIA ALERT STATE ---
+        var showBradyDialog by remember { mutableStateOf(false) }
+        var bradyEpisodeHandled by remember { mutableStateOf(false) }
+        var bradyCountdown by remember { mutableStateOf(15) }
+        var bradyThreshold by remember { mutableStateOf(prefs.getInt("brady_threshold", 50)) }   // BPM threshold
+        var bradyAlarmVolume by remember { mutableStateOf(prefs.getInt("brady_alarm_volume", 85)) } // 0–100
         var contacts by remember { mutableStateOf(EmergencyContactStore.getContacts(this@MainActivity)) }
+
+        if (!onboardingDone) {
+            OnboardingScreen(
+                onFinish = {
+                    prefs.edit().putBoolean("onboarding_done", true).apply()
+                    onboardingDone = true
+                }
+            )
+            return
+        }
+
+        LaunchedEffect(Unit) {
+            val running = isBackgroundMonitoringServiceRunning()
+            backgroundMonitoringEnabled = running
+            prefs.edit().putBoolean(BackgroundMonitoringService.KEY_BG_MONITORING_ENABLED, running).apply()
+        }
 
         // Trigger dialog on first detection of each anomaly episode
         LaunchedEffect(statusDisplay) {
@@ -161,6 +267,118 @@ class MainActivity : ComponentActivity() {
             )
         }
 
+            @Composable
+            fun BradyAlertDialog(
+                countdown: Int,
+                hasContacts: Boolean,
+                volume: Int,
+                onCancel: () -> Unit,
+                onAlert: () -> Unit
+            ) {
+                val context = LocalContext.current
+                val vibrator = context.getSystemService(Context.VIBRATOR_SERVICE) as? Vibrator
+                val toneGenerator = remember(volume) { ToneGenerator(AudioManager.STREAM_ALARM, volume.coerceIn(0, 100)) }
+
+                DisposableEffect(Unit) {
+                    onDispose {
+                        try {
+                            toneGenerator.release()
+                        } catch (_: Exception) { }
+                    }
+                }
+
+                LaunchedEffect(countdown) {
+                    try {
+                        toneGenerator.startTone(ToneGenerator.TONE_CDMA_ALERT_CALL_GUARD, 500)
+                        if (vibrator != null) {
+                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                                vibrator.vibrate(VibrationEffect.createOneShot(400, VibrationEffect.DEFAULT_AMPLITUDE))
+                            } else {
+                                @Suppress("DEPRECATION")
+                                vibrator.vibrate(400)
+                            }
+                        }
+                    } catch (_: Exception) { /* ignore vibration failures */ }
+                }
+
+                AlertDialog(
+                    onDismissRequest = { /* Require explicit choice */ },
+                    containerColor = uiPanel,
+                    title = {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Icon(Icons.Default.Warning, contentDescription = null, tint = uiAccentAlt, modifier = Modifier.size(24.dp))
+                            Spacer(Modifier.width(8.dp))
+                            Text("LOW HEART RATE", color = uiAccentAlt, fontSize = 15.sp, fontWeight = FontWeight.Black)
+                        }
+                    },
+                    text = {
+                        Column {
+                            Text(
+                                "A sustained low heart rate (bradycardia) was detected. If you feel dizzy, faint, or unresponsive, notify emergency contacts now.",
+                                color = Color.White,
+                                fontSize = 14.sp,
+                                lineHeight = 20.sp
+                            )
+                            Spacer(Modifier.height(12.dp))
+                            if (!hasContacts) {
+                                Card(colors = CardDefaults.cardColors(containerColor = Color(0xFF4A2D26)), shape = RoundedCornerShape(8.dp)) {
+                                    Text(
+                                        "⚠ No emergency contacts saved. Add contacts using the person icon in the top bar.",
+                                        color = uiAccentAlt,
+                                        fontSize = 12.sp,
+                                        modifier = Modifier.padding(10.dp)
+                                    )
+                                }
+                            } else {
+                                Text("Tap I'M OK to dismiss, or SEND ALERT to notify contacts immediately.", color = uiTextMuted, fontSize = 12.sp)
+                            }
+                            Spacer(Modifier.height(12.dp))
+                            LinearProgressIndicator(progress = { countdown / 15f }, modifier = Modifier.fillMaxWidth(), color = uiAccentAlt, trackColor = uiStroke)
+                            Spacer(Modifier.height(6.dp))
+                            Text("Auto-sending in $countdown s…", color = uiTextMuted, fontSize = 11.sp, textAlign = TextAlign.Center, modifier = Modifier.fillMaxWidth())
+                        }
+                    },
+                    confirmButton = {
+                        Button(onClick = onCancel, colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF6AA57B)), shape = RoundedCornerShape(8.dp)) {
+                            Text("I'M OK", fontWeight = FontWeight.Bold)
+                        }
+                    },
+                    dismissButton = {
+                        Button(onClick = onAlert, colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFB96A7D)), shape = RoundedCornerShape(8.dp)) {
+                            Text("SEND ALERT", fontWeight = FontWeight.Bold)
+                        }
+                    }
+                )
+            }
+
+        // Countdown & auto-send for bradycardia alerts
+        LaunchedEffect(showBradyDialog) {
+            if (showBradyDialog) {
+                bradyCountdown = 15
+                while (showBradyDialog && bradyCountdown > 0) {
+                    delay(1000L)
+                    if (showBradyDialog) bradyCountdown--
+                }
+                if (showBradyDialog) {
+                    showBradyDialog = false
+                    sendWhatsAppAlerts(contacts)
+                }
+            }
+        }
+
+        if (showBradyDialog) {
+            BradyAlertDialog(
+                countdown = bradyCountdown,
+                hasContacts = contacts.isNotEmpty(),
+                volume = bradyAlarmVolume,
+                onCancel = { showBradyDialog = false },
+                onAlert = {
+                    showBradyDialog = false
+                    sendWhatsAppAlerts(contacts)
+                }
+            )
+        }
+
         val permissionsToRequest = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             arrayOf(Manifest.permission.BLUETOOTH_SCAN, Manifest.permission.BLUETOOTH_CONNECT)
         } else {
@@ -185,7 +403,35 @@ class MainActivity : ComponentActivity() {
         if (streamManager == null) {
             streamManager = BleStreamManager(
                 context = this,
-                onLog = { msg -> runOnUiThread { logs += "\n$msg" } },
+                onLog = { msg ->
+                    runOnUiThread {
+                        // Keep BLE-related messages separate from model/test logs
+                        bleLogs += "\n$msg"
+
+                        // Heuristically update connection state / device name
+                        try {
+                            if (msg.contains("Connected")) {
+                                deviceConnected = true
+                                lastSeen = SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date())
+                                if (msg.contains("TARGET FOUND")) {
+                                    val start = msg.indexOf('(')
+                                    val end = msg.indexOf(')')
+                                    if (start >= 0 && end > start) connectedDeviceName = msg.substring(start + 1, end)
+                                }
+                            } else if (msg.contains("Disconnected") || msg.contains("Scan timeout") || msg.contains("Bluetooth disabled") || msg.contains("Connection error")) {
+                                deviceConnected = false
+                                lastSeen = SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date())
+                            } else if (msg.contains("TARGET FOUND") && connectedDeviceName == "\u2014") {
+                                val start = msg.indexOf('(')
+                                val end = msg.indexOf(')')
+                                if (start >= 0 && end > start) {
+                                    connectedDeviceName = msg.substring(start + 1, end)
+                                    lastSeen = SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date())
+                                }
+                            }
+                        } catch (_: Exception) { /* non-critical */ }
+                    }
+                },
                 onDataReceived = { inputData, _ ->
 
                     val tStart = System.nanoTime()
@@ -219,6 +465,12 @@ class MainActivity : ComponentActivity() {
                     val tEnd = System.nanoTime()
                     val inferenceTimeMs = (tEnd - tStart) / 1_000_000.0
 
+                    val peakIndices = SignalProcessor.detectRPeakIndices(centeredData)
+                    val rrIntervalsMs = SignalProcessor.rrIntervalsMsFromPeaks(peakIndices)
+                    val hrv = SignalProcessor.calculateHrvMetrics(rrIntervalsMs)
+                    val beatMorphology = SignalProcessor.estimateBeatMorphology(centeredData, peakIndices)
+                    val signalQuality = SignalProcessor.estimateSignalQuality(cleanData)
+                    val dominantFreq = SignalProcessor.estimateDominantFrequencyHz(centeredData)
                     val heartRate = SignalProcessor.calculateHeartRate(centeredData)
 
                     // --- UPDATE UI STATE ---
@@ -227,7 +479,37 @@ class MainActivity : ComponentActivity() {
                         mseDisplay = String.format("%.4f", finalMse)
                         latencyDisplay = String.format("%.1f ms", inferenceTimeMs)
                         heartRateDisplay = if (heartRate in 30..220) "$heartRate BPM" else "-- BPM"
+                        sdnnDisplay = hrv?.let { String.format("%.1f ms", it.sdnnMs) } ?: "-- ms"
+                        rmssdDisplay = hrv?.let { String.format("%.1f ms", it.rmssdMs) } ?: "-- ms"
+                        pnn50Display = hrv?.let { String.format("%.0f %%", it.pnn50) } ?: "-- %"
+                        dominantFreqDisplay = dominantFreq?.let { String.format("%.2f Hz", it) } ?: "-- Hz"
+                        qualityDisplay = "$signalQuality%"
+                        rPeakDisplay = beatMorphology?.let { String.format("%.2f mV", it.avgRPeakMv) } ?: "--"
+                        qrsDisplay = beatMorphology?.let { String.format("%.0f ms", it.avgQrsMs) } ?: "--"
+                        rrIntervalsForExport = rrIntervalsMs
+
+                        if (heartRate in 30..220) {
+                            heartRateHistory = (heartRateHistory + heartRate).takeLast(36).toIntArray()
+                        }
+                        if (heartRateHistory.isNotEmpty()) {
+                            val avg = heartRateHistory.average().toInt()
+                            val minHr = heartRateHistory.minOrNull() ?: avg
+                            val maxHr = heartRateHistory.maxOrNull() ?: avg
+                            hrTrendDisplay = "$avg avg ($minHr-$maxHr)"
+                        }
+
                         logs += "\n[Prediction] MSE: $mseDisplay | HR: $heartRateDisplay"
+
+                        // BRADYCARDIA: prompt an alarm dialog when sustained low HR is detected
+                        try {
+                            if (heartRate > 0 && heartRate < bradyThreshold && statusDisplay != "ANOMALY DETECTED" && !bradyEpisodeHandled) {
+                                showBradyDialog = true
+                                bradyEpisodeHandled = true
+                            }
+                            if (heartRate >= bradyThreshold) {
+                                bradyEpisodeHandled = false
+                            }
+                        } catch (_: Exception) { /* non-critical guard */ }
 
                         // Extract the last 500 samples (2 seconds) for a clean visual plot
                         graphData = if (centeredData.size >= 500) {
@@ -249,53 +531,235 @@ class MainActivity : ComponentActivity() {
         }
 
         // --- NAVIGATION ROUTING ---
-        // Added .systemBarsPadding() right here to fix the overlap issue!
-        Column(modifier = Modifier.fillMaxSize().systemBarsPadding()) {
-            // Custom Top Bar
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .background(
+                    Brush.verticalGradient(
+                        colors = listOf(uiBgTop, uiBgMid, uiBgBottom)
+                    )
+                )
+                .windowInsetsPadding(WindowInsets.safeDrawing.only(WindowInsetsSides.Top))
+        ) {
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .background(Color(0xFF161B22))
+                    .background(uiPanel)
                     .padding(horizontal = 16.dp, vertical = 12.dp),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween
             ) {
-                Text("ECGGuard", fontSize = 22.sp, fontWeight = FontWeight.Bold, color = Color.White)
-                Row {
-                    // Contacts icon
-                    IconButton(onClick = {
-                        currentScreen = if (currentScreen == "CONTACTS") "HOME" else "CONTACTS"
-                    }) {
-                        Icon(
-                            imageVector = if (currentScreen == "CONTACTS") Icons.Default.Close else Icons.Default.Person,
-                            contentDescription = "Contacts",
-                            tint = if (currentScreen == "CONTACTS") Color.White else Color(0xFF3498DB)
-                        )
-                    }
-                    // Settings icon
-                    IconButton(onClick = {
-                        currentScreen = if (currentScreen == "SETTINGS") "HOME" else "SETTINGS"
-                    }) {
-                        Icon(
-                            imageVector = if (currentScreen == "SETTINGS") Icons.Default.Close else Icons.Default.Settings,
-                            contentDescription = "Settings",
-                            tint = Color.White
-                        )
-                    }
+                Column {
+                    Text("ECGGuard", fontSize = 22.sp, fontWeight = FontWeight.Bold, color = Color.White)
+                    Text("Real-time ECG Intelligence", fontSize = 11.sp, color = uiTextMuted)
+                }
+                if (backgroundMonitoringEnabled) {
+                    Text(
+                        "BG ON",
+                        color = Color(0xFF9FE0A3),
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.Bold,
+                        modifier = Modifier
+                            .background(Color(0x339FE0A3), RoundedCornerShape(7.dp))
+                            .padding(horizontal = 8.dp, vertical = 4.dp)
+                    )
                 }
             }
 
-            // Screen Content
-            when (currentScreen) {
-                "HOME" -> HomeScreen(statusDisplay, statusColor, mseDisplay, latencyDisplay, heartRateDisplay, graphData, isBuffering)
-                "SETTINGS" -> SettingsScreen(logs, { permissionLauncher.launch(permissionsToRequest) })
-                "CONTACTS" -> EmergencyContactsScreen(
-                    contacts = contacts,
-                    onContactsChanged = { updated ->
-                        contacts = updated
-                        EmergencyContactStore.saveContacts(this@MainActivity, updated)
-                    }
+            Box(modifier = Modifier.weight(1f)) {
+                when (currentScreen) {
+                    "HOME" -> HomeScreen(
+                        statusDisplay = statusDisplay,
+                        statusColor = statusColor,
+                        mseDisplay = mseDisplay,
+                        latencyDisplay = latencyDisplay,
+                        heartRateDisplay = heartRateDisplay,
+                        sdnnDisplay = sdnnDisplay,
+                        rmssdDisplay = rmssdDisplay,
+                        pnn50Display = pnn50Display,
+                        dominantFreqDisplay = dominantFreqDisplay,
+                        qualityDisplay = qualityDisplay,
+                        hrTrendDisplay = hrTrendDisplay,
+                        rPeakDisplay = rPeakDisplay,
+                        qrsDisplay = qrsDisplay,
+                        graphData = graphData,
+                        isBuffering = isBuffering
+                    )
+                    "SETTINGS" -> SettingsScreen(
+                        connected = deviceConnected,
+                        deviceName = connectedDeviceName,
+                        lastSeen = lastSeen,
+                        backgroundMonitoringEnabled = backgroundMonitoringEnabled,
+                        onStartBackgroundMonitoring = {
+                            try {
+                                streamManager?.disconnect()
+                                streamManager = null
+                                val svcIntent = Intent(this@MainActivity, BackgroundMonitoringService::class.java).apply {
+                                    action = BackgroundMonitoringService.ACTION_START
+                                }
+                                ContextCompat.startForegroundService(this@MainActivity, svcIntent)
+                                backgroundMonitoringEnabled = true
+                                prefs.edit().putBoolean(BackgroundMonitoringService.KEY_BG_MONITORING_ENABLED, true).apply()
+                                exportStatus = "Background monitoring enabled."
+                            } catch (e: Exception) {
+                                backgroundMonitoringEnabled = false
+                                prefs.edit().putBoolean(BackgroundMonitoringService.KEY_BG_MONITORING_ENABLED, false).apply()
+                                exportStatus = "Failed to enable background monitoring: ${e.message ?: "unknown error"}"
+                                Log.e("ECGGuard", "Failed to start background monitoring", e)
+                            }
+                        },
+                        onStopBackgroundMonitoring = {
+                            try {
+                                // Stop directly to avoid background-start restrictions while stopping.
+                                stopService(Intent(this@MainActivity, BackgroundMonitoringService::class.java))
+                                backgroundMonitoringEnabled = false
+                                prefs.edit().putBoolean(BackgroundMonitoringService.KEY_BG_MONITORING_ENABLED, false).apply()
+                                exportStatus = "Background monitoring disabled."
+                            } catch (e: Exception) {
+                                exportStatus = "Failed to disable background monitoring: ${e.message ?: "unknown error"}"
+                                Log.e("ECGGuard", "Failed to stop background monitoring", e)
+                            }
+                        },
+                        bleLogs = bleLogs,
+                        showAdvanced = showAdvancedLogs,
+                        onToggleAdvanced = { showAdvancedLogs = !showAdvancedLogs },
+                        exportStatus = exportStatus,
+                        canExportRr = rrIntervalsForExport.isNotEmpty(),
+                        onExportRr = {
+                            val path = exportRrIntervalsCsv(rrIntervalsForExport)
+                            exportStatus = if (path != null) "Exported RR CSV: $path" else "Export failed (no RR data yet)."
+                        },
+                        bradyThreshold = bradyThreshold,
+                        onBradyThresholdChange = {
+                            bradyThreshold = it
+                            prefs.edit().putInt("brady_threshold", it).apply()
+                        },
+                        bradyAlarmVolume = bradyAlarmVolume,
+                        onBradyVolumeChange = {
+                            bradyAlarmVolume = it
+                            prefs.edit().putInt("brady_alarm_volume", it).apply()
+                        },
+                        onConnect = { permissionLauncher.launch(permissionsToRequest) }
+                    )
+                    "CONTACTS" -> EmergencyContactsScreen(
+                        contacts = contacts,
+                        onContactsChanged = { updated ->
+                            contacts = updated
+                            EmergencyContactStore.saveContacts(this@MainActivity, updated)
+                        }
+                    )
+                }
+            }
+
+            NavigationBar(
+                containerColor = uiPanel,
+                tonalElevation = 6.dp
+            ) {
+                NavigationBarItem(
+                    selected = currentScreen == "HOME",
+                    onClick = { currentScreen = "HOME" },
+                    colors = NavigationBarItemDefaults.colors(
+                        selectedIconColor = uiAccent,
+                        selectedTextColor = uiAccent,
+                        indicatorColor = Color(0x33E879A8),
+                        unselectedIconColor = uiTextMuted,
+                        unselectedTextColor = uiTextMuted
+                    ),
+                    icon = { Icon(Icons.Default.Home, contentDescription = "Home") },
+                    label = { Text("Home") }
                 )
+                NavigationBarItem(
+                    selected = currentScreen == "CONTACTS",
+                    onClick = { currentScreen = "CONTACTS" },
+                    colors = NavigationBarItemDefaults.colors(
+                        selectedIconColor = uiAccent,
+                        selectedTextColor = uiAccent,
+                        indicatorColor = Color(0x33E879A8),
+                        unselectedIconColor = uiTextMuted,
+                        unselectedTextColor = uiTextMuted
+                    ),
+                    icon = { Icon(Icons.Default.Person, contentDescription = "Contacts") },
+                    label = { Text("Contacts") }
+                )
+                NavigationBarItem(
+                    selected = currentScreen == "SETTINGS",
+                    onClick = { currentScreen = "SETTINGS" },
+                    colors = NavigationBarItemDefaults.colors(
+                        selectedIconColor = uiAccent,
+                        selectedTextColor = uiAccent,
+                        indicatorColor = Color(0x33E879A8),
+                        unselectedIconColor = uiTextMuted,
+                        unselectedTextColor = uiTextMuted
+                    ),
+                    icon = { Icon(Icons.Default.Settings, contentDescription = "Settings") },
+                    label = { Text("Settings") }
+                )
+            }
+        }
+    }
+
+    @Composable
+    fun OnboardingScreen(onFinish: () -> Unit) {
+        val pages = listOf(
+            Triple("Welcome to ECGGuard", "Continuous ECG monitoring with on-device intelligence.", "Track rhythm, HRV, and signal quality in real time."),
+            Triple("Safety First", "Emergency contacts can be alerted when serious events occur.", "Set brady alarm threshold and alarm volume in Settings."),
+            Triple("Background Monitoring", "Use foreground monitoring service to keep tracking with screen off.", "Start/Stop background mode from Settings > Background Monitoring.")
+        )
+        var page by remember { mutableStateOf(0) }
+        val isLast = page == pages.lastIndex
+
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .background(Brush.verticalGradient(listOf(uiBgTop, uiBgMid, uiBgBottom)))
+                .windowInsetsPadding(WindowInsets.safeDrawing.only(WindowInsetsSides.Top))
+                .padding(24.dp),
+            verticalArrangement = Arrangement.SpaceBetween
+        ) {
+            Column {
+                Text("ECGGuard Setup", color = uiAccent, fontSize = 13.sp, fontWeight = FontWeight.Bold)
+                Spacer(Modifier.height(18.dp))
+                Text(pages[page].first, color = Color.White, fontSize = 28.sp, fontWeight = FontWeight.Black)
+                Spacer(Modifier.height(12.dp))
+                Text(pages[page].second, color = Color(0xFFE0D0DE), fontSize = 15.sp, lineHeight = 22.sp)
+                Spacer(Modifier.height(10.dp))
+                Text(pages[page].third, color = uiTextMuted, fontSize = 13.sp, lineHeight = 20.sp)
+            }
+
+            Column {
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
+                    repeat(pages.size) { idx ->
+                        Box(
+                            modifier = Modifier
+                                .weight(1f)
+                                .height(4.dp)
+                                .background(
+                                    if (idx == page) uiAccent else uiStroke.copy(alpha = 0.45f),
+                                    RoundedCornerShape(3.dp)
+                                )
+                        )
+                    }
+                }
+                Spacer(Modifier.height(18.dp))
+                Row(horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.fillMaxWidth()) {
+                    OutlinedButton(
+                        onClick = onFinish,
+                        modifier = Modifier.weight(1f),
+                        shape = RoundedCornerShape(9.dp)
+                    ) {
+                        Text("SKIP")
+                    }
+                    Button(
+                        onClick = {
+                            if (isLast) onFinish() else page++
+                        },
+                        colors = ButtonDefaults.buttonColors(containerColor = uiAccent),
+                        modifier = Modifier.weight(1f),
+                        shape = RoundedCornerShape(9.dp)
+                    ) {
+                        Text(if (isLast) "GET STARTED" else "NEXT", fontWeight = FontWeight.Bold)
+                    }
+                }
             }
         }
     }
@@ -305,6 +769,14 @@ class MainActivity : ComponentActivity() {
         statusDisplay: String, statusColor: Color,
         mseDisplay: String, latencyDisplay: String,
         heartRateDisplay: String,
+        sdnnDisplay: String,
+        rmssdDisplay: String,
+        pnn50Display: String,
+        dominantFreqDisplay: String,
+        qualityDisplay: String,
+        hrTrendDisplay: String,
+        rPeakDisplay: String,
+        qrsDisplay: String,
         graphData: FloatArray, isBuffering: Boolean
     ) {
         val scrollState = rememberScrollState()
@@ -326,6 +798,15 @@ class MainActivity : ComponentActivity() {
                 .padding(16.dp),
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
+            Text(
+                "Live Overview",
+                modifier = Modifier.fillMaxWidth(),
+                color = uiTextMuted,
+                fontSize = 12.sp,
+                fontWeight = FontWeight.SemiBold
+            )
+            Spacer(Modifier.height(8.dp))
+
             // ── 1. ANIMATED STATUS BANNER ─────────────────────────────────────
             Card(
                 colors = CardDefaults.cardColors(containerColor = statusColor),
@@ -359,7 +840,7 @@ class MainActivity : ComponentActivity() {
             // ── 2. LIVE ECG CHART ─────────────────────────────────────────────
             Box(Modifier.fillMaxWidth()) {
                 Card(
-                    colors = CardDefaults.cardColors(containerColor = Color(0xFF020A02)),
+                    colors = CardDefaults.cardColors(containerColor = Color(0xFF2A1E24)),
                     shape = RoundedCornerShape(16.dp),
                     elevation = CardDefaults.cardElevation(defaultElevation = 4.dp),
                     modifier = Modifier.fillMaxWidth().height(230.dp)
@@ -368,13 +849,13 @@ class MainActivity : ComponentActivity() {
                         if (isBuffering) {
                             Column(horizontalAlignment = Alignment.CenterHorizontally) {
                                 CircularProgressIndicator(
-                                    color = Color(0xFF39FF14),
+                                    color = uiAccent,
                                     strokeWidth = 3.dp
                                 )
                                 Spacer(Modifier.height(14.dp))
                                 Text(
                                     "Filling 10-Second Buffer…",
-                                    color = Color(0xFF39FF14).copy(alpha = 0.7f),
+                                    color = uiAccent.copy(alpha = 0.8f),
                                     fontSize = 13.sp
                                 )
                             }
@@ -386,7 +867,7 @@ class MainActivity : ComponentActivity() {
                 // Blinking LIVE badge (top-right corner of chart)
                 if (!isBuffering) {
                     Card(
-                        colors = CardDefaults.cardColors(containerColor = Color(0xFFCC2200)),
+                        colors = CardDefaults.cardColors(containerColor = Color(0xFF9A3D62)),
                         shape = RoundedCornerShape(6.dp),
                         modifier = Modifier
                             .align(Alignment.TopEnd)
@@ -423,13 +904,93 @@ class MainActivity : ComponentActivity() {
                 MetricCard(
                     title = "Recon. Error (MSE)",
                     value = mseDisplay,
-                    accentColor = Color(0xFF3498DB),
+                    accentColor = uiAccent,
                     modifier = Modifier.weight(1f)
                 )
                 MetricCard(
                     title = "AI Latency",
                     value = latencyDisplay,
-                    accentColor = Color(0xFF9B59B6),
+                    accentColor = Color(0xFFB084CC),
+                    modifier = Modifier.weight(1f)
+                )
+            }
+
+            Spacer(Modifier.height(12.dp))
+
+            Row(
+                Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                MetricCard(
+                    title = "HRV SDNN",
+                    value = sdnnDisplay,
+                    accentColor = Color(0xFF7EC6AB),
+                    modifier = Modifier.weight(1f)
+                )
+                MetricCard(
+                    title = "HRV RMSSD",
+                    value = rmssdDisplay,
+                    accentColor = uiAccentAlt,
+                    modifier = Modifier.weight(1f)
+                )
+            }
+
+            Spacer(Modifier.height(12.dp))
+
+            Row(
+                Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                MetricCard(
+                    title = "pNN50",
+                    value = pnn50Display,
+                    accentColor = Color(0xFF76AF98),
+                    modifier = Modifier.weight(1f)
+                )
+                MetricCard(
+                    title = "Dominant Freq",
+                    value = dominantFreqDisplay,
+                    accentColor = Color(0xFFC08BA8),
+                    modifier = Modifier.weight(1f)
+                )
+            }
+
+            Spacer(Modifier.height(12.dp))
+
+            Row(
+                Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                MetricCard(
+                    title = "Signal Quality",
+                    value = qualityDisplay,
+                    accentColor = Color(0xFF8DCB9B),
+                    modifier = Modifier.weight(1f)
+                )
+                MetricCard(
+                    title = "HR Trend",
+                    value = hrTrendDisplay,
+                    accentColor = Color(0xFFA67CB8),
+                    modifier = Modifier.weight(1f)
+                )
+            }
+
+            Spacer(Modifier.height(12.dp))
+
+            Row(
+                Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                MetricCard(
+                    title = "R / QRS",
+                    value = "$rPeakDisplay | $qrsDisplay",
+                    accentColor = uiAccentAlt,
+                    modifier = Modifier.weight(1f)
+                )
+                MetricCard(
+                    title = "Status",
+                    value = statusDisplay.take(12),
+                    accentColor = statusColor,
                     modifier = Modifier.weight(1f)
                 )
             }
@@ -445,8 +1006,8 @@ class MainActivity : ComponentActivity() {
         Canvas(modifier = Modifier.fillMaxSize().padding(8.dp)) {
             val width = size.width
             val height = size.height
-            val majorGrid = Color(0xFF003300)
-            val minorGrid = Color(0xFF001500)
+            val majorGrid = Color(0xFF5A3A48)
+            val minorGrid = Color(0xFF3E2732)
 
             // Fine ECG-paper grid (20 columns, 10 rows; every 2nd line is major)
             for (i in 0..20) {
@@ -458,7 +1019,7 @@ class MainActivity : ComponentActivity() {
                 drawLine(if (i % 2 == 0) majorGrid else minorGrid, Offset(0f, y), Offset(width, y), strokeWidth = 0.6f)
             }
             // Subtle centre baseline
-            drawLine(Color(0xFF005000), Offset(0f, height / 2f), Offset(width, height / 2f), strokeWidth = 1f)
+            drawLine(Color(0xFF6A4558), Offset(0f, height / 2f), Offset(width, height / 2f), strokeWidth = 1f)
 
             // Scale data, leaving 5 % margin top & bottom
             val maxVal = data.maxOrNull() ?: 1f
@@ -476,7 +1037,7 @@ class MainActivity : ComponentActivity() {
             }
 
             // Neon-green glow: three layered strokes (outer → core)
-            val ecgColor = Color(0xFF39FF14)
+            val ecgColor = uiAccent
             drawPath(path, ecgColor.copy(alpha = 0.07f), style = Stroke(width = 16f))
             drawPath(path, ecgColor.copy(alpha = 0.18f), style = Stroke(width = 8f))
             drawPath(path, ecgColor.copy(alpha = 0.55f), style = Stroke(width = 3.5f))
@@ -493,7 +1054,7 @@ class MainActivity : ComponentActivity() {
     ) {
         AlertDialog(
             onDismissRequest = { /* Require explicit choice — no outside-tap dismiss */ },
-            containerColor = Color(0xFF1A1A2E),
+            containerColor = uiPanel,
             title = {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Icon(
@@ -523,7 +1084,7 @@ class MainActivity : ComponentActivity() {
                     Spacer(Modifier.height(16.dp))
                     if (!hasContacts) {
                         Card(
-                            colors = CardDefaults.cardColors(containerColor = Color(0xFF2C1A00)),
+                            colors = CardDefaults.cardColors(containerColor = Color(0xFF4A2D26)),
                             shape = RoundedCornerShape(8.dp)
                         ) {
                             Text(
@@ -537,7 +1098,7 @@ class MainActivity : ComponentActivity() {
                     } else {
                         Text(
                             "Tap NO to immediately send an SMS with your location to all emergency contacts. No internet required.",
-                            color = Color.Gray,
+                            color = uiTextMuted,
                             fontSize = 12.sp,
                             lineHeight = 18.sp
                         )
@@ -547,12 +1108,12 @@ class MainActivity : ComponentActivity() {
                         progress = { countdown / 10f },
                         modifier = Modifier.fillMaxWidth(),
                         color = Color(0xFFE74C3C),
-                        trackColor = Color(0xFF2C2C2C)
+                        trackColor = Color(0xFF4A2F3B)
                     )
                     Spacer(Modifier.height(5.dp))
                     Text(
                         "Auto-sending in $countdown s…",
-                        color = Color.Gray,
+                        color = uiTextMuted,
                         fontSize = 11.sp,
                         textAlign = TextAlign.Center,
                         modifier = Modifier.fillMaxWidth()
@@ -589,13 +1150,13 @@ class MainActivity : ComponentActivity() {
         var phoneInput by remember { mutableStateOf("") }
         val scrollState = rememberScrollState()
         val fieldColors = OutlinedTextFieldDefaults.colors(
-            focusedBorderColor = Color(0xFF3498DB),
-            unfocusedBorderColor = Color(0xFF444444),
-            focusedLabelColor = Color(0xFF3498DB),
-            unfocusedLabelColor = Color.Gray,
+            focusedBorderColor = uiAccent,
+            unfocusedBorderColor = uiStroke,
+            focusedLabelColor = uiAccent,
+            unfocusedLabelColor = uiTextMuted,
             focusedTextColor = Color.White,
             unfocusedTextColor = Color.White,
-            cursorColor = Color.White
+            cursorColor = uiAccent
         )
 
         Column(
@@ -613,7 +1174,7 @@ class MainActivity : ComponentActivity() {
             Spacer(Modifier.height(4.dp))
             Text(
                 "When an anomaly is confirmed, your location will be sent to these contacts via WhatsApp.",
-                color = Color.Gray,
+                color = uiTextMuted,
                 fontSize = 12.sp,
                 lineHeight = 18.sp
             )
@@ -622,7 +1183,7 @@ class MainActivity : ComponentActivity() {
 
             // ── Add contact form ──────────────────────────────────────────────
             Card(
-                colors = CardDefaults.cardColors(containerColor = Color(0xFF161B22)),
+                colors = CardDefaults.cardColors(containerColor = uiPanel),
                 shape = RoundedCornerShape(12.dp),
                 modifier = Modifier.fillMaxWidth()
             ) {
@@ -665,7 +1226,7 @@ class MainActivity : ComponentActivity() {
                                 phoneInput = ""
                             }
                         },
-                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF3498DB)),
+                        colors = ButtonDefaults.buttonColors(containerColor = uiAccent),
                         shape = RoundedCornerShape(8.dp),
                         modifier = Modifier.fillMaxWidth()
                     ) {
@@ -683,7 +1244,7 @@ class MainActivity : ComponentActivity() {
                 Box(
                     Modifier
                         .fillMaxWidth()
-                        .background(Color(0xFF161B22), RoundedCornerShape(12.dp))
+                        .background(uiPanel, RoundedCornerShape(12.dp))
                         .padding(24.dp),
                     contentAlignment = Alignment.Center
                 ) {
@@ -698,7 +1259,7 @@ class MainActivity : ComponentActivity() {
                 Spacer(Modifier.height(8.dp))
                 contacts.forEachIndexed { index, contact ->
                     Card(
-                        colors = CardDefaults.cardColors(containerColor = Color(0xFF161B22)),
+                        colors = CardDefaults.cardColors(containerColor = uiPanel),
                         shape = RoundedCornerShape(10.dp),
                         modifier = Modifier.fillMaxWidth()
                     ) {
@@ -711,12 +1272,12 @@ class MainActivity : ComponentActivity() {
                             Box(
                                 Modifier
                                     .size(36.dp)
-                                    .background(Color(0xFF1A3A5C), CircleShape),
+                                    .background(uiPanelAlt, CircleShape),
                                 contentAlignment = Alignment.Center
                             ) {
                                 Text(
                                     contact.name.first().uppercaseChar().toString(),
-                                    color = Color(0xFF3498DB),
+                                    color = uiAccent,
                                     fontWeight = FontWeight.Bold,
                                     fontSize = 16.sp
                                 )
@@ -759,8 +1320,20 @@ class MainActivity : ComponentActivity() {
             else       -> "NORMAL"
         }
 
+        val pulseDuration = if (bpm in 30..180) ((60_000f / bpm).toInt()).coerceIn(300, 1600) else 900
+        val transition = rememberInfiniteTransition(label = "heartPulse")
+        val heartScale by transition.animateFloat(
+            initialValue = 0.85f,
+            targetValue = 1.15f,
+            animationSpec = infiniteRepeatable(
+                animation = tween(pulseDuration, easing = FastOutSlowInEasing),
+                repeatMode = RepeatMode.Reverse
+            ),
+            label = "heartScale"
+        )
+
         Card(
-            colors = CardDefaults.cardColors(containerColor = Color(0xFF161B22)),
+            colors = CardDefaults.cardColors(containerColor = uiPanel),
             shape = RoundedCornerShape(12.dp),
             modifier = Modifier.fillMaxWidth().height(90.dp)
         ) {
@@ -771,7 +1344,13 @@ class MainActivity : ComponentActivity() {
             ) {
                 Column {
                     Row(verticalAlignment = Alignment.CenterVertically) {
-                        Box(Modifier.size(4.dp).background(hrColor, CircleShape))
+                        Icon(
+                            imageVector = Icons.Default.Favorite,
+                            contentDescription = null,
+                            tint = hrColor.copy(alpha = 0.85f),
+                            modifier = Modifier
+                                .size((14f * heartScale).dp)
+                        )
                         Spacer(Modifier.width(6.dp))
                         Text("HEART RATE", color = Color.Gray, fontSize = 11.sp, fontWeight = FontWeight.Medium)
                     }
@@ -794,54 +1373,204 @@ class MainActivity : ComponentActivity() {
     }
 
     @Composable
-    fun SettingsScreen(logs: String, onConnect: () -> Unit) {
+    fun SettingsScreen(
+        connected: Boolean,
+        deviceName: String,
+        lastSeen: String,
+        backgroundMonitoringEnabled: Boolean,
+        onStartBackgroundMonitoring: () -> Unit,
+        onStopBackgroundMonitoring: () -> Unit,
+        bleLogs: String,
+        showAdvanced: Boolean,
+        onToggleAdvanced: () -> Unit,
+        exportStatus: String,
+        canExportRr: Boolean,
+        onExportRr: () -> Unit,
+        bradyThreshold: Int,
+        onBradyThresholdChange: (Int) -> Unit,
+        bradyAlarmVolume: Int,
+        onBradyVolumeChange: (Int) -> Unit,
+        onConnect: () -> Unit
+    ) {
         val scrollState = rememberScrollState()
 
         Column(modifier = Modifier.fillMaxSize().padding(16.dp)) {
             Text("Device Connectivity", fontSize = 20.sp, fontWeight = FontWeight.Bold, color = Color.White)
+            Spacer(Modifier.height(4.dp))
+            Text("Configure alerts, diagnostics, and background mode.", color = uiTextMuted, fontSize = 12.sp)
             Spacer(Modifier.height(16.dp))
 
-            Button(
-                onClick = onConnect,
-                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF3498DB)),
-                modifier = Modifier.fillMaxWidth().height(55.dp),
-                shape = RoundedCornerShape(8.dp)
+            Card(
+                colors = CardDefaults.cardColors(containerColor = uiPanel),
+                shape = RoundedCornerShape(12.dp),
+                modifier = Modifier.fillMaxWidth()
             ) {
-                Text("SCAN & CONNECT WEARABLE", fontSize = 16.sp, fontWeight = FontWeight.Bold)
+                Row(Modifier.fillMaxWidth().padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
+                    val statusColor = if (connected) Color(0xFF9FE0A3) else Color(0xFF7C6674)
+                    Box(Modifier.size(14.dp).background(statusColor, CircleShape))
+                    Spacer(Modifier.width(12.dp))
+                    Column(Modifier.weight(1f)) {
+                        Text(if (connected) "Connected" else "Disconnected", color = Color.White, fontSize = 16.sp, fontWeight = FontWeight.Bold)
+                        Spacer(Modifier.height(4.dp))
+                        Text(deviceName, color = Color.Gray, fontSize = 12.sp)
+                        Text("Last seen: $lastSeen", color = Color.Gray, fontSize = 11.sp)
+                    }
+                    Spacer(Modifier.width(8.dp))
+                    Button(onClick = onConnect, colors = ButtonDefaults.buttonColors(containerColor = uiAccent), shape = RoundedCornerShape(8.dp)) {
+                        Text("SCAN & CONNECT", fontWeight = FontWeight.Bold)
+                    }
+                }
             }
 
-            Spacer(Modifier.height(24.dp))
-            Text("System Diagnostics:", color = Color.Gray, fontSize = 14.sp)
-            Spacer(Modifier.height(8.dp))
+            Spacer(Modifier.height(20.dp))
 
-            Box(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .weight(1f)
-                    .background(Color(0xFF161B22), RoundedCornerShape(8.dp))
-                    .padding(12.dp)
-                    .verticalScroll(scrollState)
+            Card(
+                colors = CardDefaults.cardColors(containerColor = uiPanel),
+                shape = RoundedCornerShape(12.dp),
+                modifier = Modifier.fillMaxWidth()
             ) {
-                Text(logs, fontSize = 12.sp, color = Color(0xFF58A6FF), lineHeight = 18.sp, fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace)
+                Column(Modifier.padding(horizontal = 16.dp, vertical = 14.dp)) {
+                    Text("Background Monitoring", color = Color.White, fontWeight = FontWeight.SemiBold, fontSize = 14.sp)
+                    Spacer(Modifier.height(6.dp))
+                    Text(
+                        if (backgroundMonitoringEnabled) "Running in foreground service. You can lock screen and keep monitoring."
+                        else "Start service to keep BLE monitoring active when the app is in background.",
+                        color = Color.Gray,
+                        fontSize = 12.sp,
+                        lineHeight = 18.sp
+                    )
+                    Spacer(Modifier.height(12.dp))
+                    Row(horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.fillMaxWidth()) {
+                        Button(
+                            onClick = onStartBackgroundMonitoring,
+                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF6AA57B)),
+                            shape = RoundedCornerShape(8.dp),
+                            modifier = Modifier.weight(1f)
+                        ) {
+                            Text("START BG", fontWeight = FontWeight.Bold)
+                        }
+                        Button(
+                            onClick = onStopBackgroundMonitoring,
+                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFB96A7D)),
+                            shape = RoundedCornerShape(8.dp),
+                            modifier = Modifier.weight(1f)
+                        ) {
+                            Text("STOP BG", fontWeight = FontWeight.Bold)
+                        }
+                    }
+                }
+            }
+
+            Spacer(Modifier.height(16.dp))
+
+            // ── BRADYCARDIA ALARM SETTINGS ─────────────────────────────────
+            Card(
+                colors = CardDefaults.cardColors(containerColor = uiPanel),
+                shape = RoundedCornerShape(12.dp),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Column(Modifier.padding(horizontal = 16.dp, vertical = 14.dp)) {
+                    Text("Bradycardia Alarm", color = Color.White, fontWeight = FontWeight.SemiBold, fontSize = 14.sp)
+                    Spacer(Modifier.height(14.dp))
+
+                    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                        Column(Modifier.weight(1f)) {
+                            Text("Threshold", color = Color.Gray, fontSize = 11.sp)
+                            Text("$bradyThreshold BPM", color = uiAccentAlt, fontSize = 18.sp, fontWeight = FontWeight.Bold)
+                        }
+                        Spacer(Modifier.width(8.dp))
+                        Row {
+                            IconButton(onClick = { if (bradyThreshold > 30) onBradyThresholdChange(bradyThreshold - 5) }) {
+                                Text("−", color = Color.White, fontSize = 22.sp, fontWeight = FontWeight.Bold)
+                            }
+                            IconButton(onClick = { if (bradyThreshold < 90) onBradyThresholdChange(bradyThreshold + 5) }) {
+                                Text("+", color = Color.White, fontSize = 22.sp, fontWeight = FontWeight.Bold)
+                            }
+                        }
+                    }
+
+                    Spacer(Modifier.height(6.dp))
+                    Slider(
+                        value = bradyThreshold.toFloat(),
+                        onValueChange = { onBradyThresholdChange(it.toInt()) },
+                        valueRange = 30f..90f,
+                        steps = 11,
+                        colors = SliderDefaults.colors(thumbColor = uiAccentAlt, activeTrackColor = uiAccentAlt)
+                    )
+
+                    Spacer(Modifier.height(12.dp))
+
+                    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                        Column(Modifier.weight(1f)) {
+                            Text("Alarm Volume", color = Color.Gray, fontSize = 11.sp)
+                            Text("$bradyAlarmVolume %", color = uiAccent, fontSize = 18.sp, fontWeight = FontWeight.Bold)
+                        }
+                    }
+                    Spacer(Modifier.height(6.dp))
+                    Slider(
+                        value = bradyAlarmVolume.toFloat(),
+                        onValueChange = { onBradyVolumeChange(it.toInt()) },
+                        valueRange = 0f..100f,
+                        steps = 19,
+                        colors = SliderDefaults.colors(thumbColor = uiAccent, activeTrackColor = uiAccent)
+                    )
+                }
+            }
+
+            Spacer(Modifier.height(16.dp))
+
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                Text("Advanced diagnostics", color = Color.Gray, fontSize = 14.sp, modifier = Modifier.weight(1f))
+                Switch(checked = showAdvanced, onCheckedChange = { onToggleAdvanced() }, colors = SwitchDefaults.colors(checkedThumbColor = uiAccent))
+            }
+
+            if (showAdvanced) {
+                Spacer(Modifier.height(12.dp))
+                Button(
+                    onClick = onExportRr,
+                    enabled = canExportRr,
+                    colors = ButtonDefaults.buttonColors(containerColor = uiAccent),
+                    shape = RoundedCornerShape(8.dp),
+                    modifier = Modifier.fillMaxWidth().height(46.dp)
+                ) {
+                    Text("EXPORT RR CSV", fontWeight = FontWeight.Bold)
+                }
+                if (exportStatus.isNotBlank()) {
+                    Spacer(Modifier.height(8.dp))
+                    Text(exportStatus, color = Color.Gray, fontSize = 11.sp, lineHeight = 16.sp)
+                }
+                Spacer(Modifier.height(12.dp))
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .weight(1f)
+                        .background(uiPanelAlt, RoundedCornerShape(8.dp))
+                        .padding(12.dp)
+                        .verticalScroll(scrollState)
+                ) {
+                    Text(if (bleLogs.isBlank()) "No BLE logs yet." else bleLogs, fontSize = 12.sp, color = uiAccent, lineHeight = 18.sp, fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace)
+                }
+            } else {
+                Spacer(Modifier.height(12.dp))
+                Text("Tip: Toggle to view low-level BLE logs.", color = Color.Gray, fontSize = 12.sp)
             }
         }
     }
 
     @Composable
-    fun MetricCard(title: String, value: String, accentColor: Color = Color(0xFF3498DB), modifier: Modifier = Modifier) {
+    fun MetricCard(title: String, value: String, accentColor: Color = Color(0xFFE879A8), modifier: Modifier = Modifier) {
         Card(
-            colors = CardDefaults.cardColors(containerColor = Color(0xFF161B22)),
+            colors = CardDefaults.cardColors(containerColor = uiPanelAlt),
             shape = RoundedCornerShape(12.dp),
             modifier = modifier.height(90.dp)
         ) {
-            Column(Modifier.padding(16.dp).fillMaxSize(), verticalArrangement = Arrangement.Center) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Box(Modifier.size(4.dp).background(accentColor, CircleShape))
-                    Spacer(Modifier.width(6.dp))
-                    Text(title, color = Color.Gray, fontSize = 11.sp, fontWeight = FontWeight.Medium)
+            Column(Modifier.padding(14.dp).fillMaxSize(), verticalArrangement = Arrangement.Center) {
+                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    Box(Modifier.size(5.dp).background(accentColor, CircleShape))
+                    Text(title, color = Color(0xFF95A2B3), fontSize = 10.sp, fontWeight = FontWeight.Medium)
                 }
-                Spacer(Modifier.height(6.dp))
-                Text(value, color = Color.White, fontSize = 21.sp, fontWeight = FontWeight.Bold)
+                Spacer(Modifier.height(8.dp))
+                Text(value, color = Color.White, fontSize = 20.sp, fontWeight = FontWeight.Bold, maxLines = 1)
             }
         }
     }
@@ -851,6 +1580,17 @@ class MainActivity : ComponentActivity() {
 // MATHEMATICAL CLONE OF PYTHON SCIPY/NUMPY PIPELINE (Unchanged)
 // ======================================================================
 object SignalProcessor {
+
+    data class HrvMetrics(
+        val sdnnMs: Float,
+        val rmssdMs: Float,
+        val pnn50: Float
+    )
+
+    data class BeatMorphology(
+        val avgRPeakMv: Float,
+        val avgQrsMs: Float
+    )
 
     fun cleanSignal(input: FloatArray): FloatArray {
         val cleaned = FloatArray(input.size) { i ->
@@ -947,6 +1687,180 @@ object SignalProcessor {
         return false
     }
 
+    fun detectRPeakIndices(signal: FloatArray, sampleRate: Int = 250): IntArray {
+        if (signal.size < sampleRate) return IntArray(0)
+
+        val maxVal = signal.maxOrNull() ?: return IntArray(0)
+        if (maxVal <= 0f) return IntArray(0)
+
+        val threshold = maxVal * 0.55f
+        val minPeakDist = (sampleRate * 0.30f).toInt()
+
+        val peaks = ArrayList<Int>()
+        var lastPeakIdx = -minPeakDist
+
+        for (i in 1 until signal.size - 1) {
+            if (signal[i] > threshold &&
+                signal[i] >= signal[i - 1] &&
+                signal[i] >= signal[i + 1] &&
+                (i - lastPeakIdx) >= minPeakDist
+            ) {
+                peaks.add(i)
+                lastPeakIdx = i
+            }
+        }
+
+        return peaks.toIntArray()
+    }
+
+    fun rrIntervalsMsFromPeaks(peaks: IntArray, sampleRate: Int = 250): FloatArray {
+        if (peaks.size < 2) return FloatArray(0)
+        val rr = FloatArray(peaks.size - 1)
+        for (i in 1 until peaks.size) {
+            val samples = peaks[i] - peaks[i - 1]
+            rr[i - 1] = (samples * 1000f) / sampleRate
+        }
+        return rr
+    }
+
+    fun calculateHrvMetrics(rrMs: FloatArray): HrvMetrics? {
+        if (rrMs.size < 2) return null
+
+        val mean = rrMs.average().toFloat()
+        if (mean <= 0f) return null
+
+        var sumSq = 0f
+        rrMs.forEach { v ->
+            val d = v - mean
+            sumSq += d * d
+        }
+        val sdnn = sqrt(sumSq / rrMs.size)
+
+        var diffSq = 0f
+        var nn50 = 0
+        for (i in 1 until rrMs.size) {
+            val diff = rrMs[i] - rrMs[i - 1]
+            val ad = abs(diff)
+            diffSq += diff * diff
+            if (ad > 50f) nn50++
+        }
+        val rmssd = sqrt(diffSq / (rrMs.size - 1).coerceAtLeast(1))
+        val pnn50 = (nn50.toFloat() / (rrMs.size - 1).coerceAtLeast(1)) * 100f
+
+        return HrvMetrics(sdnnMs = sdnn, rmssdMs = rmssd, pnn50 = pnn50)
+    }
+
+    fun estimateSignalQuality(window: FloatArray): Int {
+        if (window.isEmpty()) return 0
+
+        val mean = window.average().toFloat()
+        var variance = 0f
+        var extremeCount = 0
+        var diffSum = 0f
+
+        for (i in window.indices) {
+            val v = window[i]
+            variance += (v - mean) * (v - mean)
+            if (abs(v) > 3.0f) extremeCount++
+            if (i > 0) diffSum += abs(v - window[i - 1])
+        }
+
+        val stdDev = sqrt(variance / window.size)
+        val extremeRatio = extremeCount.toFloat() / window.size
+        val roughness = diffSum / (window.size - 1).coerceAtLeast(1)
+
+        var score = 100f
+        if (stdDev < 0.0015f) {
+            score -= 55f
+        } else if (stdDev < 0.004f) {
+            score -= 30f
+        }
+
+        score -= (extremeRatio * 300f)
+        score -= (roughness * 45f)
+
+        return score.toInt().coerceIn(0, 100)
+    }
+
+    fun estimateDominantFrequencyHz(
+        signal: FloatArray,
+        sampleRate: Int = 250,
+        minHz: Float = 0.5f,
+        maxHz: Float = 8.0f
+    ): Float? {
+        if (signal.size < sampleRate || minHz >= maxHz) return null
+
+        val bins = 60
+        val step = (maxHz - minHz) / bins
+        var bestFreq = minHz
+        var bestPower = 0.0
+
+        for (i in 0..bins) {
+            val freq = minHz + i * step
+            val omega = (2.0 * PI * freq) / sampleRate
+            val coeff = 2.0 * cos(omega)
+            var q0 = 0.0
+            var q1 = 0.0
+            var q2 = 0.0
+
+            for (x in signal) {
+                q0 = coeff * q1 - q2 + x
+                q2 = q1
+                q1 = q0
+            }
+
+            val power = q1 * q1 + q2 * q2 - coeff * q1 * q2
+            if (power > bestPower) {
+                bestPower = power
+                bestFreq = freq
+            }
+        }
+
+        return if (bestPower > 0.0) bestFreq else null
+    }
+
+    fun estimateBeatMorphology(signal: FloatArray, peaks: IntArray, sampleRate: Int = 250): BeatMorphology? {
+        if (signal.isEmpty() || peaks.isEmpty()) return null
+
+        var ampSum = 0f
+        var qrsMsSum = 0f
+        var counted = 0
+        val maxHalfWindow = (sampleRate * 0.12f).toInt().coerceAtLeast(1)
+
+        for (peak in peaks) {
+            if (peak <= 0 || peak >= signal.lastIndex) continue
+
+            val peakAmp = signal[peak]
+            if (peakAmp <= 0f) continue
+
+            val halfAmp = peakAmp * 0.5f
+            var left = peak
+            var right = peak
+
+            var steps = 0
+            while (left > 1 && signal[left] > halfAmp && steps < maxHalfWindow) {
+                left--
+                steps++
+            }
+
+            steps = 0
+            while (right < signal.lastIndex - 1 && signal[right] > halfAmp && steps < maxHalfWindow) {
+                right++
+                steps++
+            }
+
+            val widthSamples = (right - left).coerceAtLeast(1)
+            val qrsMs = (widthSamples * 1000f) / sampleRate
+
+            ampSum += peakAmp
+            qrsMsSum += qrsMs
+            counted++
+        }
+
+        if (counted == 0) return null
+        return BeatMorphology(avgRPeakMv = ampSum / counted, avgQrsMs = qrsMsSum / counted)
+    }
+
     /**
      * Estimates heart rate (BPM) by detecting R-peaks in the centered ECG signal.
      * Uses a local-maximum threshold approach with a 300 ms refractory period.
@@ -955,28 +1869,7 @@ object SignalProcessor {
      * @return Heart rate in BPM, or 0 if detection failed
      */
     fun calculateHeartRate(signal: FloatArray, sampleRate: Int = 250): Int {
-        if (signal.size < sampleRate) return 0
-
-        val maxVal = signal.maxOrNull() ?: return 0
-        if (maxVal <= 0f) return 0
-
-        // Threshold: 55 % of the tallest R-peak amplitude
-        val threshold = maxVal * 0.55f
-        // Minimum R-R distance: 300 ms → 75 samples (caps at ~200 BPM)
-        val minPeakDist = (sampleRate * 0.30f).toInt()
-
-        var peakCount = 0
-        var lastPeakIdx = -minPeakDist
-
-        for (i in 1 until signal.size - 1) {
-            if (signal[i] > threshold &&
-                signal[i] >= signal[i - 1] &&
-                signal[i] >= signal[i + 1] &&
-                (i - lastPeakIdx) >= minPeakDist) {
-                peakCount++
-                lastPeakIdx = i
-            }
-        }
+        val peakCount = detectRPeakIndices(signal, sampleRate).size
 
         val durationSec = signal.size.toFloat() / sampleRate
         return if (peakCount > 0) ((peakCount.toFloat() / durationSec) * 60f).toInt() else 0

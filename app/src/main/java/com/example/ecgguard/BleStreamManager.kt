@@ -97,6 +97,22 @@ class BleStreamManager(
         scanTimeoutHandler.postDelayed(scanTimeoutRunnable!!, 10000)
     }
 
+    fun disconnect() {
+        cancelScanTimeout()
+        stopScanSafely()
+        try {
+            gatt?.disconnect()
+        } catch (_: Exception) {
+        }
+        try {
+            gatt?.close()
+        } catch (_: Exception) {
+        }
+        gatt = null
+        signalBuffer.clear()
+        packetCount = 0
+    }
+
     private val scanCallback = object : ScanCallback() {
         override fun onScanResult(callbackType: Int, result: ScanResult?) {
             val device = result?.device ?: return
