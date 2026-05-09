@@ -111,9 +111,8 @@ class MainActivity : ComponentActivity() {
     }
 
     @SuppressLint("MissingPermission")
-    private fun sendWhatsAppAlerts(contacts: List<EmergencyContact>) {
+    private fun sendWhatsAppAlerts(contacts: List<EmergencyContact>, condition: String, patientName: String) {
         if (contacts.isEmpty()) return
-
         var locationText = "(Location unavailable)"
         try {
             val lm = getSystemService(LOCATION_SERVICE) as LocationManager
@@ -127,21 +126,23 @@ class MainActivity : ComponentActivity() {
             }
         } catch (e: Exception) { /* ignore */ }
 
-        val text = "ECGGuard ALERT: Cardiac anomaly detected! " +
-            "Immediate attention may be needed. Location: $locationText"
+        val displayName = if (patientName.isBlank()) "Patient" else patientName
+        val text = "ECGGuard ALERT: $displayName — $condition. Location: $locationText"
 
-        // Opens WhatsApp for each contact with the message pre-filled.
-        // The contact just taps Send — no API key required.
+        // Open the SMS composer for each contact with message pre-filled.
+        // This avoids needing SEND_SMS permission and lets the user confirm/send.
         contacts.forEach { contact ->
             try {
-                val phone = contact.phone.replace(Regex("[^0-9]"), "")
-                val encoded = java.net.URLEncoder.encode(text, "UTF-8")
-                val uri = Uri.parse("https://wa.me/$phone?text=$encoded")
-                val intent = Intent(Intent.ACTION_VIEW, uri).apply {
+                val phone = contact.phone.replace(Regex("[^0-9+]"), "")
+                val uri = Uri.parse("smsto:$phone")
+                val intent = Intent(Intent.ACTION_SENDTO, uri).apply {
+                    putExtra("sms_body", text)
                     addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                 }
                 startActivity(intent)
-            } catch (e: Exception) { /* WhatsApp not installed */ }
+            } catch (e: Exception) {
+                // If SMS app isn't available or URI fails, ignore and continue
+            }
         }
     }
 
@@ -167,6 +168,7 @@ class MainActivity : ComponentActivity() {
         // --- SHARED STATE ---
         val prefs = remember { getSharedPreferences(BackgroundMonitoringService.PREFS_NAME, Context.MODE_PRIVATE) }
         var onboardingDone by remember { mutableStateOf(prefs.getBoolean("onboarding_done", false)) }
+        var patientName by remember { mutableStateOf(prefs.getString("patient_name", "") ?: "") }
         var currentScreen by remember { mutableStateOf("HOME") }
         var backgroundMonitoringEnabled by remember {
             mutableStateOf(prefs.getBoolean(BackgroundMonitoringService.KEY_BG_MONITORING_ENABLED, false))
@@ -222,6 +224,16 @@ class MainActivity : ComponentActivity() {
             return
         }
 
+        // First-launch patient name prompt
+        if (patientName.isBlank()) {
+            PatientNameScreen(onSave = { name ->
+                val cleaned = name.trim()
+                prefs.edit().putString("patient_name", cleaned).apply()
+                patientName = cleaned
+            })
+            return
+        }
+
         LaunchedEffect(Unit) {
             val running = isBackgroundMonitoringServiceRunning()
             backgroundMonitoringEnabled = running
@@ -249,7 +261,7 @@ class MainActivity : ComponentActivity() {
                 }
                 if (showAnomalyDialog) {
                     showAnomalyDialog = false
-                    sendWhatsAppAlerts(contacts)
+                    sendWhatsAppAlerts(contacts, statusDisplay, patientName)
                 }
             }
         }
@@ -262,7 +274,7 @@ class MainActivity : ComponentActivity() {
                 onFineClick = { showAnomalyDialog = false },
                 onAlertClick = {
                     showAnomalyDialog = false
-                    sendWhatsAppAlerts(contacts)
+                    sendWhatsAppAlerts(contacts, statusDisplay, patientName)
                 }
             )
         }
@@ -361,7 +373,7 @@ class MainActivity : ComponentActivity() {
                 }
                 if (showBradyDialog) {
                     showBradyDialog = false
-                    sendWhatsAppAlerts(contacts)
+                    sendWhatsAppAlerts(contacts, "BRADYCARDIA", patientName)
                 }
             }
         }
@@ -374,7 +386,7 @@ class MainActivity : ComponentActivity() {
                 onCancel = { showBradyDialog = false },
                 onAlert = {
                     showBradyDialog = false
-                    sendWhatsAppAlerts(contacts)
+                    sendWhatsAppAlerts(contacts, "BRADYCARDIA", patientName)
                 }
             )
         }
@@ -589,6 +601,12 @@ class MainActivity : ComponentActivity() {
                         connected = deviceConnected,
                         deviceName = connectedDeviceName,
                         lastSeen = lastSeen,
+                        patientName = patientName,
+                        onPatientNameChange = { newName ->
+                            val cleaned = newName.trim()
+                            prefs.edit().putString("patient_name", cleaned).apply()
+                            patientName = cleaned
+                        },
                         backgroundMonitoringEnabled = backgroundMonitoringEnabled,
                         onStartBackgroundMonitoring = {
                             try {
@@ -759,6 +777,39 @@ class MainActivity : ComponentActivity() {
                     ) {
                         Text(if (isLast) "GET STARTED" else "NEXT", fontWeight = FontWeight.Bold)
                     }
+                }
+            }
+        }
+    }
+
+    @Composable
+    fun PatientNameScreen(onSave: (String) -> Unit) {
+        var name by remember { mutableStateOf("") }
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .background(Brush.verticalGradient(listOf(uiBgTop, uiBgMid, uiBgBottom)))
+                .windowInsetsPadding(WindowInsets.safeDrawing.only(WindowInsetsSides.Top))
+                .padding(24.dp),
+            verticalArrangement = Arrangement.Center,
+            horizontalAlignment = Alignment.CenterHorizontally
+        ) {
+            Text("Patient Name", color = uiAccent, fontSize = 13.sp, fontWeight = FontWeight.Bold)
+            Spacer(Modifier.height(18.dp))
+            Text("Please enter the patient's name to use in emergency alerts.", color = uiTextMuted, fontSize = 14.sp, textAlign = TextAlign.Center)
+            Spacer(Modifier.height(18.dp))
+            OutlinedTextField(
+                value = name,
+                onValueChange = { name = it },
+                placeholder = { Text("Full name") },
+                singleLine = true,
+                modifier = Modifier.fillMaxWidth(),
+                colors = OutlinedTextFieldDefaults.colors()
+            )
+            Spacer(Modifier.height(18.dp))
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+                Button(onClick = { if (name.isNotBlank()) onSave(name) }, colors = ButtonDefaults.buttonColors(containerColor = uiAccent)) {
+                    Text("SAVE")
                 }
             }
         }
@@ -1377,6 +1428,8 @@ class MainActivity : ComponentActivity() {
         connected: Boolean,
         deviceName: String,
         lastSeen: String,
+        patientName: String,
+        onPatientNameChange: (String) -> Unit,
         backgroundMonitoringEnabled: Boolean,
         onStartBackgroundMonitoring: () -> Unit,
         onStopBackgroundMonitoring: () -> Unit,
@@ -1395,6 +1448,50 @@ class MainActivity : ComponentActivity() {
         val scrollState = rememberScrollState()
 
         Column(modifier = Modifier.fillMaxSize().padding(16.dp)) {
+            // Patient identity card
+            Card(
+                colors = CardDefaults.cardColors(containerColor = uiPanel),
+                shape = RoundedCornerShape(12.dp),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                var showEdit by remember { mutableStateOf(false) }
+                var tempName by remember { mutableStateOf(patientName) }
+                Column(Modifier.fillMaxWidth().padding(16.dp)) {
+                    Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
+                        Column(Modifier.weight(1f)) {
+                            Text("Patient", color = Color.White, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
+                            Spacer(Modifier.height(4.dp))
+                            Text(if (patientName.isBlank()) "(not set)" else patientName, color = Color.Gray, fontSize = 13.sp)
+                        }
+                        IconButton(onClick = { tempName = patientName; showEdit = true }) {
+                            Icon(Icons.Default.Person, contentDescription = "Edit patient name", tint = uiAccent)
+                        }
+                    }
+                }
+                if (showEdit) {
+                    AlertDialog(
+                        onDismissRequest = { showEdit = false },
+                        containerColor = uiPanel,
+                        title = { Text("Edit patient name", color = Color.White) },
+                        text = {
+                            OutlinedTextField(
+                                value = tempName,
+                                onValueChange = { tempName = it },
+                                singleLine = true,
+                                modifier = Modifier.fillMaxWidth(),
+                                colors = OutlinedTextFieldDefaults.colors()
+                            )
+                        },
+                        confirmButton = {
+                            Button(onClick = { onPatientNameChange(tempName); showEdit = false }, colors = ButtonDefaults.buttonColors(containerColor = uiAccent)) { Text("Save") }
+                        },
+                        dismissButton = {
+                            TextButton(onClick = { showEdit = false }) { Text("Cancel") }
+                        }
+                    )
+                }
+            }
+
             Text("Device Connectivity", fontSize = 20.sp, fontWeight = FontWeight.Bold, color = Color.White)
             Spacer(Modifier.height(4.dp))
             Text("Configure alerts, diagnostics, and background mode.", color = uiTextMuted, fontSize = 12.sp)
