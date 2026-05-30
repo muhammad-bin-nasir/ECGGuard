@@ -204,14 +204,122 @@ def replay(port: str, baud: int, filepath: str, column,
         print("Serial port closed.")
 
 
+def replay_tcp(host: str, port: int, filepath: str, column,
+               scale: float, loop: bool, sample_rate: int, remove_dc: bool):
+    """
+    USB / ADB direct mode – streams ECG to the phone over a TCP socket
+    forwarded via ADB, bypassing the ESP32 entirely.
+
+    Steps:
+      1.  Connect phone via USB with USB debugging enabled.
+      2.  In a terminal:  adb forward tcp:<port> tcp:<port>
+      3.  In the ECGGuard app (Settings screen) tap "START USB LISTENER".
+      4.  Run this script with --usb.
+
+    The data format is identical to the BLE/Serial path:
+    little-endian int16 samples, CHUNK_SAMPLES per send.
+    """
+    import socket as _socket
+
+    print(f"Loading '{filepath}' ...")
+    samples = load_ecg(filepath, column)
+    if not samples:
+        print("ERROR: No samples found in the CSV file.", file=sys.stderr)
+        sys.exit(1)
+
+    if remove_dc:
+        dc = sum(samples) / len(samples)
+        samples = [s - dc for s in samples]
+        print(f"  DC removed : subtracted mean = {dc:.2f}")
+
+    raw_min = clamp_int16(min(samples) * scale)
+    raw_max = clamp_int16(max(samples) * scale)
+    duration_s = len(samples) / sample_rate
+
+    print(f"  Samples  : {len(samples)}  ({duration_s:.1f} s at {sample_rate} Hz)")
+    print(f"  CSV range: [{min(samples):.4f}, {max(samples):.4f}]")
+    print(f"  Scale    : \u00d7{scale}  \u2192  int16 range [{raw_min}, {raw_max}]")
+    print(f"  Mode     : USB/TCP (adb forward tcp:{port} tcp:{port})")
+
+    print(f"\nConnecting to {host}:{port} ...")
+    print("Make sure you ran:  adb forward tcp:{0} tcp:{0}".format(port))
+    print("And tapped 'START USB LISTENER' in the ECGGuard Settings screen.\n")
+
+    try:
+        sock = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+        sock.settimeout(30)          # fail fast if app is not listening
+        sock.connect((host, port))
+        sock.settimeout(None)
+        print("TCP connected. Streaming ECG data…\n")
+    except (_socket.timeout, ConnectionRefusedError) as exc:
+        print(f"ERROR: Could not connect to {host}:{port} – {exc}", file=sys.stderr)
+        print("Check: 1) USB cable connected  2) adb forward ran  3) app listener started")
+        sys.exit(1)
+
+    interval = CHUNK_SAMPLES / sample_rate
+
+    idx          = 0
+    total_sent   = 0
+    running      = True
+    start_wall   = __import__('time').perf_counter()
+
+    try:
+        while running:
+            t0 = __import__('time').perf_counter()
+
+            chunk = []
+            for _ in range(CHUNK_SAMPLES):
+                raw = clamp_int16(samples[idx % len(samples)] * scale)
+                chunk.append(raw)
+                idx += 1
+                if idx >= len(samples):
+                    if loop:
+                        idx = 0
+                    else:
+                        running = False
+                        break
+
+            if not chunk:
+                break
+
+            payload = struct.pack(f'<{len(chunk)}h', *chunk)
+            try:
+                sock.sendall(payload)
+            except (_socket.error, BrokenPipeError):
+                print("\nSocket closed by app – stream ended.")
+                break
+
+            total_sent += len(chunk)
+
+            if total_sent % 250 < CHUNK_SAMPLES:
+                elapsed = __import__('time').perf_counter() - start_wall
+                pct = (idx % len(samples)) / len(samples) * 100
+                print(f"  [{elapsed:6.1f}s] Sent {total_sent:>6} samples | file pos {pct:.0f}%")
+
+            elapsed_chunk = __import__('time').perf_counter() - t0
+            sleep_time = interval - elapsed_chunk
+            if sleep_time > 0.002:
+                __import__('time').sleep(sleep_time)
+
+    except KeyboardInterrupt:
+        pass
+    finally:
+        sock.close()
+
+    total_s = total_sent / sample_rate
+    print(f"\nDone.  Sent {total_sent} samples ({total_s:.1f} s of ECG).")
+    print("TCP socket closed.")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Stream ECG CSV to ESP32 over Serial → BLE → ECGGuard app",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__
     )
-    parser.add_argument('--port',        required=True,
-                        help="Serial port of the ESP32 (e.g. COM3 or /dev/ttyUSB0)")
+    parser.add_argument('--port',        required=False, default=None,
+                        help="Serial port of the ESP32 (e.g. COM3 or /dev/ttyUSB0). "
+                             "Required unless --usb is set.")
     parser.add_argument('--file',        required=True,
                         help="Path to ECG CSV file")
     parser.add_argument('--column',      default='1',
@@ -233,6 +341,16 @@ def main():
     parser.add_argument('--no-remove-dc', dest='remove_dc', action='store_false')
     parser.add_argument('--sample-rate', type=int, default=250,
                         help="Original recording sample rate in Hz (default: 250)")
+
+    # ── USB / ADB direct mode ─────────────────────────────────────────────────
+    parser.add_argument('--usb', action='store_true',
+                        help="Stream over TCP instead of Serial (requires 'adb forward tcp:9999 tcp:9999'). "
+                             "Skips --port and --baud; the app must be open and USB listener started first.")
+    parser.add_argument('--tcp-host', default='localhost',
+                        help="TCP host to connect to in --usb mode (default: localhost)")
+    parser.add_argument('--tcp-port', type=int, default=9999,
+                        help="TCP port to connect to in --usb mode (default: 9999, matches the app)")
+
     args = parser.parse_args()
 
     # Allow column to be an int index or a string name
@@ -241,16 +359,31 @@ def main():
     except ValueError:
         column = args.column   # treat as header name
 
-    replay(
-        port=args.port,
-        baud=args.baud,
-        filepath=args.file,
-        column=column,
-        scale=args.scale,
-        loop=args.loop,
-        remove_dc=args.remove_dc,
-        sample_rate=args.sample_rate
-    )
+    if not args.usb and args.port is None:
+        parser.error("--port is required when not using --usb")
+
+    if args.usb:
+        replay_tcp(
+            host=args.tcp_host,
+            port=args.tcp_port,
+            filepath=args.file,
+            column=column,
+            scale=args.scale,
+            loop=args.loop,
+            remove_dc=args.remove_dc,
+            sample_rate=args.sample_rate,
+        )
+    else:
+        replay(
+            port=args.port,
+            baud=args.baud,
+            filepath=args.file,
+            column=column,
+            scale=args.scale,
+            loop=args.loop,
+            remove_dc=args.remove_dc,
+            sample_rate=args.sample_rate
+        )
 
 
 if __name__ == '__main__':

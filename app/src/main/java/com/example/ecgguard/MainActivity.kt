@@ -68,6 +68,8 @@ import kotlin.math.sqrt
 class MainActivity : ComponentActivity() {
 
     private var streamManager: BleStreamManager? = null
+    private var usbStreamManager: UsbStreamManager? = null
+    @Volatile private var ecgDataCallback: ((FloatArray, String) -> Unit)? = null
     private var model: ECGModel? = null
 
     @Suppress("DEPRECATION")
@@ -414,6 +416,104 @@ class MainActivity : ComponentActivity() {
             }
         }
 
+        // Shared ECG data-processing callback – assigned here so both BLE and USB
+        // stream managers run the same pipeline without duplicating code.
+        ecgDataCallback = ecgCb@ { inputData: FloatArray, _: String ->
+
+            val tStart = System.nanoTime()
+
+            val mvData = FloatArray(inputData.size) { i -> inputData[i] * 0.001f }
+            val cleanData = SignalProcessor.cleanSignal(mvData)
+
+            if (!SignalProcessor.isMechanicallySound(cleanData)) {
+                runOnUiThread {
+                    statusDisplay = "ARTIFACT / MOTION DETECTED"
+                    statusColor = Color.DarkGray
+                    logs += "\n[Warning] Signal dropped by Gatekeeper."
+                }
+                return@ecgCb
+            }
+
+            val mu = cleanData.average().toFloat()
+            val centeredData = FloatArray(cleanData.size) { i -> cleanData[i] - mu }
+
+            var finalMse = 0f
+
+            if (model != null) {
+                try {
+                    val (rawMse, _) = model!!.runInference(centeredData)
+                    finalMse = rawMse
+                } catch (e: Exception) {
+                    logs += "\nModel Error: ${e.message}"
+                }
+            }
+
+            val tEnd = System.nanoTime()
+            val inferenceTimeMs = (tEnd - tStart) / 1_000_000.0
+
+            val peakIndices = SignalProcessor.detectRPeakIndices(centeredData)
+            val rrIntervalsMs = SignalProcessor.rrIntervalsMsFromPeaks(peakIndices)
+            val hrv = SignalProcessor.calculateHrvMetrics(rrIntervalsMs)
+            val beatMorphology = SignalProcessor.estimateBeatMorphology(centeredData, peakIndices)
+            val signalQuality = SignalProcessor.estimateSignalQuality(cleanData)
+            val dominantFreq = SignalProcessor.estimateDominantFrequencyHz(centeredData)
+            val heartRate = SignalProcessor.calculateHeartRate(centeredData)
+
+            // --- UPDATE UI STATE ---
+            runOnUiThread {
+                isBuffering = false
+                mseDisplay = String.format("%.4f", finalMse)
+                latencyDisplay = String.format("%.1f ms", inferenceTimeMs)
+                heartRateDisplay = if (heartRate in 30..220) "$heartRate BPM" else "-- BPM"
+                sdnnDisplay = hrv?.let { String.format("%.1f ms", it.sdnnMs) } ?: "-- ms"
+                rmssdDisplay = hrv?.let { String.format("%.1f ms", it.rmssdMs) } ?: "-- ms"
+                pnn50Display = hrv?.let { String.format("%.0f %%", it.pnn50) } ?: "-- %"
+                dominantFreqDisplay = dominantFreq?.let { String.format("%.2f Hz", it) } ?: "-- Hz"
+                qualityDisplay = "$signalQuality%"
+                rPeakDisplay = beatMorphology?.let { String.format("%.2f mV", it.avgRPeakMv) } ?: "--"
+                qrsDisplay = beatMorphology?.let { String.format("%.0f ms", it.avgQrsMs) } ?: "--"
+                rrIntervalsForExport = rrIntervalsMs
+
+                if (heartRate in 30..220) {
+                    heartRateHistory = (heartRateHistory + heartRate).takeLast(36).toIntArray()
+                }
+                if (heartRateHistory.isNotEmpty()) {
+                    val avg = heartRateHistory.average().toInt()
+                    val minHr = heartRateHistory.minOrNull() ?: avg
+                    val maxHr = heartRateHistory.maxOrNull() ?: avg
+                    hrTrendDisplay = "$avg avg ($minHr-$maxHr)"
+                }
+
+                logs += "\n[Prediction] MSE: $mseDisplay | HR: $heartRateDisplay"
+
+                // BRADYCARDIA: prompt an alarm dialog when sustained low HR is detected
+                try {
+                    if (heartRate > 0 && heartRate < bradyThreshold && statusDisplay != "ANOMALY DETECTED" && !bradyEpisodeHandled) {
+                        showBradyDialog = true
+                        bradyEpisodeHandled = true
+                    }
+                    if (heartRate >= bradyThreshold) {
+                        bradyEpisodeHandled = false
+                    }
+                } catch (_: Exception) { /* non-critical guard */ }
+
+                // Extract the last 500 samples (2 seconds) for a clean visual plot
+                graphData = if (centeredData.size >= 500) {
+                    centeredData.copyOfRange(centeredData.size - 500, centeredData.size)
+                } else {
+                    centeredData
+                }
+
+                if (finalMse > 0.30f) {
+                    statusDisplay = "ANOMALY DETECTED"
+                    statusColor = Color(0xFFE74C3C) // Red
+                } else {
+                    statusDisplay = "NORMAL RHYTHM"
+                    statusColor = Color(0xFF2ECC71) // Green
+                }
+            }
+        }
+
         // --- BACKGROUND MANAGER ---
         if (streamManager == null) {
             streamManager = BleStreamManager(
@@ -447,101 +547,7 @@ class MainActivity : ComponentActivity() {
                         } catch (_: Exception) { /* non-critical */ }
                     }
                 },
-                onDataReceived = { inputData, _ ->
-
-                    val tStart = System.nanoTime()
-
-                    val mvData = FloatArray(inputData.size) { i -> inputData[i] * 0.001f }
-                    val cleanData = SignalProcessor.cleanSignal(mvData)
-
-                    if (!SignalProcessor.isMechanicallySound(cleanData)) {
-                        runOnUiThread {
-                            statusDisplay = "ARTIFACT / MOTION DETECTED"
-                            statusColor = Color.DarkGray
-                            logs += "\n[Warning] Signal dropped by Gatekeeper."
-                        }
-                        return@BleStreamManager
-                    }
-
-                    val mu = cleanData.average().toFloat()
-                    val centeredData = FloatArray(cleanData.size) { i -> cleanData[i] - mu }
-
-                    var finalMse = 0f
-
-                    if (model != null) {
-                        try {
-                            val (rawMse, _) = model!!.runInference(centeredData)
-                            finalMse = rawMse
-                        } catch (e: Exception) {
-                            logs += "\nModel Error: ${e.message}"
-                        }
-                    }
-
-                    val tEnd = System.nanoTime()
-                    val inferenceTimeMs = (tEnd - tStart) / 1_000_000.0
-
-                    val peakIndices = SignalProcessor.detectRPeakIndices(centeredData)
-                    val rrIntervalsMs = SignalProcessor.rrIntervalsMsFromPeaks(peakIndices)
-                    val hrv = SignalProcessor.calculateHrvMetrics(rrIntervalsMs)
-                    val beatMorphology = SignalProcessor.estimateBeatMorphology(centeredData, peakIndices)
-                    val signalQuality = SignalProcessor.estimateSignalQuality(cleanData)
-                    val dominantFreq = SignalProcessor.estimateDominantFrequencyHz(centeredData)
-                    val heartRate = SignalProcessor.calculateHeartRate(centeredData)
-
-                    // --- UPDATE UI STATE ---
-                    runOnUiThread {
-                        isBuffering = false
-                        mseDisplay = String.format("%.4f", finalMse)
-                        latencyDisplay = String.format("%.1f ms", inferenceTimeMs)
-                        heartRateDisplay = if (heartRate in 30..220) "$heartRate BPM" else "-- BPM"
-                        sdnnDisplay = hrv?.let { String.format("%.1f ms", it.sdnnMs) } ?: "-- ms"
-                        rmssdDisplay = hrv?.let { String.format("%.1f ms", it.rmssdMs) } ?: "-- ms"
-                        pnn50Display = hrv?.let { String.format("%.0f %%", it.pnn50) } ?: "-- %"
-                        dominantFreqDisplay = dominantFreq?.let { String.format("%.2f Hz", it) } ?: "-- Hz"
-                        qualityDisplay = "$signalQuality%"
-                        rPeakDisplay = beatMorphology?.let { String.format("%.2f mV", it.avgRPeakMv) } ?: "--"
-                        qrsDisplay = beatMorphology?.let { String.format("%.0f ms", it.avgQrsMs) } ?: "--"
-                        rrIntervalsForExport = rrIntervalsMs
-
-                        if (heartRate in 30..220) {
-                            heartRateHistory = (heartRateHistory + heartRate).takeLast(36).toIntArray()
-                        }
-                        if (heartRateHistory.isNotEmpty()) {
-                            val avg = heartRateHistory.average().toInt()
-                            val minHr = heartRateHistory.minOrNull() ?: avg
-                            val maxHr = heartRateHistory.maxOrNull() ?: avg
-                            hrTrendDisplay = "$avg avg ($minHr-$maxHr)"
-                        }
-
-                        logs += "\n[Prediction] MSE: $mseDisplay | HR: $heartRateDisplay"
-
-                        // BRADYCARDIA: prompt an alarm dialog when sustained low HR is detected
-                        try {
-                            if (heartRate > 0 && heartRate < bradyThreshold && statusDisplay != "ANOMALY DETECTED" && !bradyEpisodeHandled) {
-                                showBradyDialog = true
-                                bradyEpisodeHandled = true
-                            }
-                            if (heartRate >= bradyThreshold) {
-                                bradyEpisodeHandled = false
-                            }
-                        } catch (_: Exception) { /* non-critical guard */ }
-
-                        // Extract the last 500 samples (2 seconds) for a clean visual plot
-                        graphData = if (centeredData.size >= 500) {
-                            centeredData.copyOfRange(centeredData.size - 500, centeredData.size)
-                        } else {
-                            centeredData
-                        }
-
-                        if (finalMse > 0.30f) {
-                            statusDisplay = "ANOMALY DETECTED"
-                            statusColor = Color(0xFFE74C3C) // Red
-                        } else {
-                            statusDisplay = "NORMAL RHYTHM"
-                            statusColor = Color(0xFF2ECC71) // Green
-                        }
-                    }
-                }
+                onDataReceived = { data, _ -> ecgDataCallback?.invoke(data, "") }
             )
         }
 
@@ -660,7 +666,36 @@ class MainActivity : ComponentActivity() {
                             bradyAlarmVolume = it
                             prefs.edit().putInt("brady_alarm_volume", it).apply()
                         },
-                        onConnect = { permissionLauncher.launch(permissionsToRequest) }
+                        onConnect = { permissionLauncher.launch(permissionsToRequest) },
+                        onConnectUsb = {
+                            streamManager?.disconnect()
+                            streamManager = null
+                            usbStreamManager?.disconnect()
+                            usbStreamManager = UsbStreamManager(
+                                onLog = { msg ->
+                                    runOnUiThread {
+                                        bleLogs += "\n[USB] $msg"
+                                        when {
+                                            msg.contains("USB client connected") -> {
+                                                deviceConnected = true
+                                                connectedDeviceName = "USB Debug (PC)"
+                                                lastSeen = SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date())
+                                            }
+                                            msg.contains("disconnected", ignoreCase = true) ||
+                                            msg.contains("error", ignoreCase = true) -> {
+                                                deviceConnected = false
+                                                lastSeen = SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date())
+                                            }
+                                        }
+                                    }
+                                },
+                                onDataReceived = { data, _ -> ecgDataCallback?.invoke(data, "") }
+                            )
+                            usbStreamManager!!.connect()
+                            statusDisplay = "USB: Waiting for adb forward…"
+                            statusColor = Color(0xFF5B9BD5)
+                            isBuffering = true
+                        }
                     )
                     "CONTACTS" -> EmergencyContactsScreen(
                         contacts = contacts,
@@ -1486,7 +1521,8 @@ class MainActivity : ComponentActivity() {
         onBradyThresholdChange: (Int) -> Unit,
         bradyAlarmVolume: Int,
         onBradyVolumeChange: (Int) -> Unit,
-        onConnect: () -> Unit
+        onConnect: () -> Unit,
+        onConnectUsb: () -> Unit
     ) {
         val scrollState = rememberScrollState()
         val patientFieldColors = OutlinedTextFieldDefaults.colors(
@@ -1569,6 +1605,51 @@ class MainActivity : ComponentActivity() {
                     Spacer(Modifier.width(8.dp))
                     Button(onClick = onConnect, colors = ButtonDefaults.buttonColors(containerColor = uiAccent), shape = RoundedCornerShape(8.dp)) {
                         Text("SCAN & CONNECT", fontWeight = FontWeight.Bold)
+                    }
+                }
+            }
+
+            Spacer(Modifier.height(10.dp))
+
+            // ── USB DEBUG MODE ─────────────────────────────────────────────
+            Card(
+                colors = CardDefaults.cardColors(containerColor = Color(0xFF22203A)),
+                shape = RoundedCornerShape(12.dp),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Column(Modifier.padding(horizontal = 16.dp, vertical = 14.dp)) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Box(
+                            Modifier
+                                .size(10.dp)
+                                .background(uiAccentAlt, RoundedCornerShape(3.dp))
+                        )
+                        Spacer(Modifier.width(8.dp))
+                        Text("USB Debug Mode (ADB)", color = Color.White, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
+                    }
+                    Spacer(Modifier.height(6.dp))
+                    Text(
+                        "Stream ECG directly from your PC via USB without an ESP32 or BLE.",
+                        color = uiTextMuted,
+                        fontSize = 12.sp,
+                        lineHeight = 17.sp
+                    )
+                    Spacer(Modifier.height(8.dp))
+                    Text(
+                        "adb forward tcp:9999 tcp:9999\npython ecg_replay.py --usb --file ecg.csv",
+                        color = uiAccentAlt,
+                        fontSize = 11.sp,
+                        lineHeight = 17.sp,
+                        fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace
+                    )
+                    Spacer(Modifier.height(12.dp))
+                    Button(
+                        onClick = onConnectUsb,
+                        colors = ButtonDefaults.buttonColors(containerColor = uiAccentAlt),
+                        shape = RoundedCornerShape(8.dp),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text("START USB LISTENER", fontWeight = FontWeight.Bold)
                     }
                 }
             }
