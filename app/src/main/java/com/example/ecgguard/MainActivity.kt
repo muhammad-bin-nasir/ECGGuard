@@ -138,7 +138,7 @@ class MainActivity : ComponentActivity() {
         message: String
     ) {
         val chatId = phone.replace(Regex("[^0-9]"), "") + "@c.us"
-        val endpoint = "$serverUrl/sessions/$sessionId/messages/send-text"
+        val endpoint = "$serverUrl/api/sessions/$sessionId/messages/send-text"
         val jsonBody = JSONObject().apply {
             put("chatId", chatId)
             put("text", message)
@@ -184,8 +184,19 @@ class MainActivity : ComponentActivity() {
         val displayName = if (patientName.isBlank()) "Patient" else patientName
         val text = "ECGGuard ALERT: $displayName — $condition. Location: $locationText"
 
-        // Open the SMS composer for each contact with message pre-filled.
-        // This avoids needing SEND_SMS permission and lets the user confirm/send.
+        // 1. Send via WhatsApp through OpenWA first (fully automatic, no confirmation)
+        val openWa = OpenWaConfig.get(this)
+        if (openWa.enabled
+            && openWa.serverUrl.isNotBlank()
+            && openWa.sessionId.isNotBlank()
+            && openWa.apiKey.isNotBlank()
+        ) {
+            contacts.forEach { contact ->
+                sendOpenWaMessage(openWa.serverUrl, openWa.sessionId, openWa.apiKey, contact.phone, text)
+            }
+        }
+
+        // 2. Then open the SMS composer for each contact with message pre-filled.
         contacts.forEach { contact ->
             try {
                 val phone = contact.phone.replace(Regex("[^0-9+]"), "")
@@ -197,18 +208,6 @@ class MainActivity : ComponentActivity() {
                 startActivity(intent)
             } catch (e: Exception) {
                 // If SMS app isn't available or URI fails, ignore and continue
-            }
-        }
-
-        // Also send via WhatsApp through OpenWA (if configured)
-        val openWa = OpenWaConfig.get(this)
-        if (openWa.enabled
-            && openWa.serverUrl.isNotBlank()
-            && openWa.sessionId.isNotBlank()
-            && openWa.apiKey.isNotBlank()
-        ) {
-            contacts.forEach { contact ->
-                sendOpenWaMessage(openWa.serverUrl, openWa.sessionId, openWa.apiKey, contact.phone, text)
             }
         }
     }
@@ -279,6 +278,7 @@ class MainActivity : ComponentActivity() {
         var bradyCountdown by remember { mutableStateOf(15) }
         var bradyThreshold by remember { mutableStateOf(prefs.getInt("brady_threshold", 50)) }   // BPM threshold
         var bradyAlarmVolume by remember { mutableStateOf(prefs.getInt("brady_alarm_volume", 85)) } // 0–100
+        var alarmMuted by remember { mutableStateOf(prefs.getBoolean("alarm_muted", false)) }
         var contacts by remember { mutableStateOf(EmergencyContactStore.getContacts(this@MainActivity)) }
 
         // --- OPENWA STATE ---
@@ -354,6 +354,7 @@ class MainActivity : ComponentActivity() {
                 countdown: Int,
                 hasContacts: Boolean,
                 volume: Int,
+                muted: Boolean,
                 onCancel: () -> Unit,
                 onAlert: () -> Unit
             ) {
@@ -370,17 +371,19 @@ class MainActivity : ComponentActivity() {
                 }
 
                 LaunchedEffect(countdown) {
-                    try {
-                        toneGenerator.startTone(ToneGenerator.TONE_CDMA_ALERT_CALL_GUARD, 500)
-                        if (vibrator != null) {
-                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                                vibrator.vibrate(VibrationEffect.createOneShot(400, VibrationEffect.DEFAULT_AMPLITUDE))
-                            } else {
-                                @Suppress("DEPRECATION")
-                                vibrator.vibrate(400)
+                    if (!muted) {
+                        try {
+                            toneGenerator.startTone(ToneGenerator.TONE_CDMA_ALERT_CALL_GUARD, 500)
+                            if (vibrator != null) {
+                                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                                    vibrator.vibrate(VibrationEffect.createOneShot(400, VibrationEffect.DEFAULT_AMPLITUDE))
+                                } else {
+                                    @Suppress("DEPRECATION")
+                                    vibrator.vibrate(400)
+                                }
                             }
-                        }
-                    } catch (_: Exception) { /* ignore vibration failures */ }
+                        } catch (_: Exception) { /* ignore vibration failures */ }
+                    }
                 }
 
                 AlertDialog(
@@ -453,6 +456,7 @@ class MainActivity : ComponentActivity() {
                 countdown = bradyCountdown,
                 hasContacts = contacts.isNotEmpty(),
                 volume = bradyAlarmVolume,
+                muted = alarmMuted,
                 onCancel = { showBradyDialog = false },
                 onAlert = {
                     showBradyDialog = false
@@ -639,16 +643,31 @@ class MainActivity : ComponentActivity() {
                     Text("ECGGuard", fontSize = 22.sp, fontWeight = FontWeight.Bold, color = Color.White)
                     Text("Real-time ECG Intelligence", fontSize = 11.sp, color = uiTextMuted)
                 }
-                if (backgroundMonitoringEnabled) {
-                    Text(
-                        "BG ON",
-                        color = Color(0xFF9FE0A3),
-                        fontSize = 11.sp,
-                        fontWeight = FontWeight.Bold,
-                        modifier = Modifier
-                            .background(Color(0x339FE0A3), RoundedCornerShape(7.dp))
-                            .padding(horizontal = 8.dp, vertical = 4.dp)
-                    )
+                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    if (backgroundMonitoringEnabled) {
+                        Text(
+                            "BG ON",
+                            color = Color(0xFF9FE0A3),
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.Bold,
+                            modifier = Modifier
+                                .background(Color(0x339FE0A3), RoundedCornerShape(7.dp))
+                                .padding(horizontal = 8.dp, vertical = 4.dp)
+                        )
+                    }
+                    TextButton(
+                        onClick = {
+                            alarmMuted = !alarmMuted
+                            prefs.edit().putBoolean("alarm_muted", alarmMuted).apply()
+                        },
+                        modifier = Modifier.defaultMinSize(minWidth = 1.dp, minHeight = 1.dp),
+                        contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 8.dp, vertical = 4.dp)
+                    ) {
+                        Text(
+                            if (alarmMuted) "🔇" else "🔊",
+                            fontSize = 20.sp
+                        )
+                    }
                 }
             }
 
