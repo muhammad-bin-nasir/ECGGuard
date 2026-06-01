@@ -56,7 +56,15 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.platform.LocalContext
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.lifecycleScope
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import org.json.JSONObject
+import java.net.HttpURLConnection
+import java.net.URL
+import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.input.VisualTransformation
 import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -115,6 +123,48 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    /**
+     * Sends a WhatsApp message to a single phone number via the self-hosted OpenWA REST API.
+     * The call is made off the main thread inside a coroutine.
+     *
+     * Phone number is normalised to WhatsApp chatId format: digits only + "@c.us"
+     * e.g. "+923001234567" → "923001234567@c.us"
+     */
+    private fun sendOpenWaMessage(
+        serverUrl: String,
+        sessionId: String,
+        apiKey: String,
+        phone: String,
+        message: String
+    ) {
+        val chatId = phone.replace(Regex("[^0-9]"), "") + "@c.us"
+        val endpoint = "$serverUrl/sessions/$sessionId/messages/send-text"
+        val jsonBody = JSONObject().apply {
+            put("chatId", chatId)
+            put("text", message)
+        }.toString()
+
+        lifecycleScope.launch(Dispatchers.IO) {
+            var connection: HttpURLConnection? = null
+            try {
+                connection = URL(endpoint).openConnection() as HttpURLConnection
+                connection.requestMethod = "POST"
+                connection.setRequestProperty("Content-Type", "application/json; charset=utf-8")
+                connection.setRequestProperty("X-API-Key", apiKey)
+                connection.doOutput = true
+                connection.connectTimeout = 10_000
+                connection.readTimeout = 10_000
+                connection.outputStream.bufferedWriter(Charsets.UTF_8).use { it.write(jsonBody) }
+                // Read response code to complete the request (ignore body)
+                connection.responseCode
+            } catch (_: Exception) {
+                // Network failures must not interrupt the alert flow
+            } finally {
+                connection?.disconnect()
+            }
+        }
+    }
+
     @SuppressLint("MissingPermission")
     private fun sendWhatsAppAlerts(contacts: List<EmergencyContact>, condition: String, patientName: String) {
         if (contacts.isEmpty()) return
@@ -147,6 +197,18 @@ class MainActivity : ComponentActivity() {
                 startActivity(intent)
             } catch (e: Exception) {
                 // If SMS app isn't available or URI fails, ignore and continue
+            }
+        }
+
+        // Also send via WhatsApp through OpenWA (if configured)
+        val openWa = OpenWaConfig.get(this)
+        if (openWa.enabled
+            && openWa.serverUrl.isNotBlank()
+            && openWa.sessionId.isNotBlank()
+            && openWa.apiKey.isNotBlank()
+        ) {
+            contacts.forEach { contact ->
+                sendOpenWaMessage(openWa.serverUrl, openWa.sessionId, openWa.apiKey, contact.phone, text)
             }
         }
     }
@@ -218,6 +280,9 @@ class MainActivity : ComponentActivity() {
         var bradyThreshold by remember { mutableStateOf(prefs.getInt("brady_threshold", 50)) }   // BPM threshold
         var bradyAlarmVolume by remember { mutableStateOf(prefs.getInt("brady_alarm_volume", 85)) } // 0–100
         var contacts by remember { mutableStateOf(EmergencyContactStore.getContacts(this@MainActivity)) }
+
+        // --- OPENWA STATE ---
+        var openWaSettings by remember { mutableStateOf(OpenWaConfig.get(this@MainActivity)) }
 
         if (!onboardingDone) {
             OnboardingScreen(
@@ -695,6 +760,11 @@ class MainActivity : ComponentActivity() {
                             statusDisplay = "USB: Waiting for adb forward…"
                             statusColor = Color(0xFF5B9BD5)
                             isBuffering = true
+                        },
+                        openWaSettings = openWaSettings,
+                        onOpenWaChange = { updated ->
+                            OpenWaConfig.save(this@MainActivity, updated)
+                            openWaSettings = updated
                         }
                     )
                     "CONTACTS" -> EmergencyContactsScreen(
@@ -1522,7 +1592,9 @@ class MainActivity : ComponentActivity() {
         bradyAlarmVolume: Int,
         onBradyVolumeChange: (Int) -> Unit,
         onConnect: () -> Unit,
-        onConnectUsb: () -> Unit
+        onConnectUsb: () -> Unit,
+        openWaSettings: OpenWaSettings,
+        onOpenWaChange: (OpenWaSettings) -> Unit
     ) {
         val scrollState = rememberScrollState()
         val patientFieldColors = OutlinedTextFieldDefaults.colors(
@@ -1746,6 +1818,134 @@ class MainActivity : ComponentActivity() {
                         steps = 19,
                         colors = SliderDefaults.colors(thumbColor = uiAccent, activeTrackColor = uiAccent)
                     )
+                }
+            }
+
+            Spacer(Modifier.height(16.dp))
+
+            // ── OPENWA WHATSAPP INTEGRATION ────────────────────────────────
+            var openWaExpanded by remember { mutableStateOf(false) }
+            var tempUrl     by remember { mutableStateOf(openWaSettings.serverUrl) }
+            var tempSession by remember { mutableStateOf(openWaSettings.sessionId) }
+            var tempKey     by remember { mutableStateOf(openWaSettings.apiKey) }
+            var showApiKey  by remember { mutableStateOf(false) }
+            val openWaFieldColors = OutlinedTextFieldDefaults.colors(
+                focusedBorderColor   = uiAccent,
+                unfocusedBorderColor = uiStroke,
+                focusedLabelColor    = Color.White,
+                unfocusedLabelColor  = uiTextMuted,
+                focusedTextColor     = Color.White,
+                unfocusedTextColor   = Color.White,
+                cursorColor          = uiAccent
+            )
+
+            Card(
+                colors = CardDefaults.cardColors(containerColor = uiPanel),
+                shape = RoundedCornerShape(12.dp),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Column(Modifier.padding(horizontal = 16.dp, vertical = 14.dp)) {
+                    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                        Column(Modifier.weight(1f)) {
+                            Text("WhatsApp Alerts (OpenWA)", color = Color.White, fontWeight = FontWeight.SemiBold, fontSize = 14.sp)
+                            Spacer(Modifier.height(2.dp))
+                            Text(
+                                if (openWaSettings.enabled) "Enabled — alerts sent via self-hosted OpenWA"
+                                else "Disabled — configure OpenWA server to enable",
+                                color = if (openWaSettings.enabled) Color(0xFF9FE0A3) else uiTextMuted,
+                                fontSize = 11.sp,
+                                lineHeight = 16.sp
+                            )
+                        }
+                        Switch(
+                            checked = openWaSettings.enabled,
+                            onCheckedChange = {
+                                onOpenWaChange(openWaSettings.copy(enabled = it))
+                            },
+                            colors = SwitchDefaults.colors(checkedThumbColor = uiAccent)
+                        )
+                    }
+
+                    Spacer(Modifier.height(8.dp))
+                    TextButton(
+                        onClick = { openWaExpanded = !openWaExpanded },
+                        contentPadding = PaddingValues(0.dp)
+                    ) {
+                        Text(
+                            if (openWaExpanded) "Hide configuration ▲" else "Configure server ▼",
+                            color = uiAccent,
+                            fontSize = 12.sp
+                        )
+                    }
+
+                    if (openWaExpanded) {
+                        Spacer(Modifier.height(10.dp))
+
+                        OutlinedTextField(
+                            value = tempUrl,
+                            onValueChange = { tempUrl = it },
+                            label = { Text("Server URL") },
+                            placeholder = { Text("http://192.168.1.100:3000", color = uiTextMuted, fontSize = 12.sp) },
+                            singleLine = true,
+                            modifier = Modifier.fillMaxWidth(),
+                            colors = openWaFieldColors,
+                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri)
+                        )
+                        Spacer(Modifier.height(8.dp))
+
+                        OutlinedTextField(
+                            value = tempSession,
+                            onValueChange = { tempSession = it },
+                            label = { Text("Session ID") },
+                            placeholder = { Text("my-session", color = uiTextMuted, fontSize = 12.sp) },
+                            singleLine = true,
+                            modifier = Modifier.fillMaxWidth(),
+                            colors = openWaFieldColors
+                        )
+                        Spacer(Modifier.height(8.dp))
+
+                        OutlinedTextField(
+                            value = tempKey,
+                            onValueChange = { tempKey = it },
+                            label = { Text("API Key (Operator)") },
+                            singleLine = true,
+                            visualTransformation = if (showApiKey) VisualTransformation.None else PasswordVisualTransformation(),
+                            modifier = Modifier.fillMaxWidth(),
+                            colors = openWaFieldColors,
+                            trailingIcon = {
+                                TextButton(onClick = { showApiKey = !showApiKey }, contentPadding = PaddingValues(horizontal = 8.dp)) {
+                                    Text(if (showApiKey) "Hide" else "Show", color = uiAccent, fontSize = 11.sp)
+                                }
+                            }
+                        )
+                        Spacer(Modifier.height(12.dp))
+
+                        Button(
+                            onClick = {
+                                onOpenWaChange(
+                                    openWaSettings.copy(
+                                        serverUrl = tempUrl.trimEnd('/'),
+                                        sessionId = tempSession.trim(),
+                                        apiKey    = tempKey.trim()
+                                    )
+                                )
+                                openWaExpanded = false
+                            },
+                            colors = ButtonDefaults.buttonColors(containerColor = uiAccent),
+                            shape = RoundedCornerShape(8.dp),
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Text("SAVE", fontWeight = FontWeight.Bold)
+                        }
+
+                        Spacer(Modifier.height(8.dp))
+                        Text(
+                            "How it works: run OpenWA server locally or in Docker, create a session by scanning the QR code in the dashboard, generate an operator API key, then paste the values above. On each alert, ECGGuard will POST to /sessions/{sessionId}/messages/send-text for every emergency contact (phone normalised to country code + digits + @c.us).",
+                            color = uiTextMuted,
+                            fontSize = 11.sp,
+                            lineHeight = 15.sp
+                        )
+                    }
                 }
             }
 
