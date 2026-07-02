@@ -1,5 +1,20 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
 
+    <!-- Main app theme (no action bar) -->
     <style name="Theme.ECGGuard" parent="android:Theme.Material.Light.NoActionBar" />
+
+    <!-- Splash screen theme using core-splashscreen library.
+         Applied to MainActivity in AndroidManifest; replaced at runtime via installSplashScreen(). -->
+    <style name="Theme.ECGGuard.Splash" parent="Theme.SplashScreen">
+        <!-- Dark plum background matching the app -->
+        <item name="windowSplashScreenBackground">#23141F</item>
+        <!-- The app icon shown centred on screen -->
+        <item name="windowSplashScreenAnimatedIcon">@mipmap/ic_launcher</item>
+        <!-- Circle behind the icon (darker panel colour) -->
+        <item name="windowSplashScreenIconBackgroundColor">#3A2532</item>
+        <!-- Transition to the real app theme after splash exits -->
+        <item name="postSplashScreenTheme">@style/Theme.ECGGuard</item>
+    </style>
+
 </resources>
