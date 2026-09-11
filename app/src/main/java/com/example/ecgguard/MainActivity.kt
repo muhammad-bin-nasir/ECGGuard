@@ -155,10 +155,13 @@ class MainActivity : ComponentActivity() {
                 connection.connectTimeout = 10_000
                 connection.readTimeout = 10_000
                 connection.outputStream.bufferedWriter(Charsets.UTF_8).use { it.write(jsonBody) }
-                // Read response code to complete the request (ignore body)
-                connection.responseCode
-            } catch (_: Exception) {
-                // Network failures must not interrupt the alert flow
+                val code = connection.responseCode
+                if (code !in 200..299) {
+                    val err = connection.errorStream?.bufferedReader()?.readText() ?: "(no body)"
+                    Log.e("ECGGuard-OpenWA", "HTTP $code for $chatId — $err")
+                }
+            } catch (e: Exception) {
+                Log.e("ECGGuard-OpenWA", "Failed to send to $chatId: ${e.message}", e)
             } finally {
                 connection?.disconnect()
             }

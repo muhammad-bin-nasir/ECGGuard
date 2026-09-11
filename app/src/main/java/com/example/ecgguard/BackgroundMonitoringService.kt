@@ -10,13 +10,23 @@ import android.content.Context
 import android.content.Intent
 import android.os.Build
 import android.os.IBinder
+import android.util.Log
 import androidx.core.app.NotificationCompat
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
+import org.json.JSONObject
+import java.net.HttpURLConnection
+import java.net.URL
 
 class BackgroundMonitoringService : Service() {
 
     private var streamManager: BleStreamManager? = null
     private var lastHeartRate = 0
     private var bradyAlertActive = false
+    private val serviceJob = SupervisorJob()
+    private val serviceScope = CoroutineScope(serviceJob + Dispatchers.IO)
 
     private fun setBgMonitoringEnabled(enabled: Boolean) {
         getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
@@ -98,6 +108,7 @@ class BackgroundMonitoringService : Service() {
         streamManager?.disconnect()
         streamManager = null
         setBgMonitoringEnabled(false)
+        serviceJob.cancel()
         super.onDestroy()
     }
 
@@ -168,6 +179,51 @@ class BackgroundMonitoringService : Service() {
             .build()
 
         manager.notify(ALERT_NOTIF_ID, notif)
+        sendWhatsAppAlerts(heartRate)
+    }
+
+    private fun sendWhatsAppAlerts(heartRate: Int) {
+        val openWa = OpenWaConfig.get(this)
+        if (!openWa.enabled || openWa.serverUrl.isBlank() || openWa.sessionId.isBlank() || openWa.apiKey.isBlank()) return
+
+        val prefs = getSharedPreferences("ecgguard_prefs", Context.MODE_PRIVATE)
+        val patientName = prefs.getString("patient_name", "Patient") ?: "Patient"
+        val contacts = EmergencyContactStore.getContacts(this)
+        if (contacts.isEmpty()) return
+
+        val text = "ECGGuard ALERT: $patientName — BRADYCARDIA detected (HR: $heartRate BPM). Please check on them."
+
+        contacts.forEach { contact ->
+            val chatId = contact.phone.replace(Regex("[^0-9]"), "") + "@c.us"
+            val endpoint = "${openWa.serverUrl}/api/sessions/${openWa.sessionId}/messages/send-text"
+            val jsonBody = JSONObject().apply {
+                put("chatId", chatId)
+                put("text", text)
+            }.toString()
+
+            serviceScope.launch {
+                var connection: HttpURLConnection? = null
+                try {
+                    connection = URL(endpoint).openConnection() as HttpURLConnection
+                    connection.requestMethod = "POST"
+                    connection.setRequestProperty("Content-Type", "application/json; charset=utf-8")
+                    connection.setRequestProperty("X-API-Key", openWa.apiKey)
+                    connection.doOutput = true
+                    connection.connectTimeout = 10_000
+                    connection.readTimeout = 10_000
+                    connection.outputStream.bufferedWriter(Charsets.UTF_8).use { it.write(jsonBody) }
+                    val code = connection.responseCode
+                    if (code !in 200..299) {
+                        val err = connection.errorStream?.bufferedReader()?.readText() ?: "(no body)"
+                        Log.e("ECGGuard-OpenWA", "BG service HTTP $code for $chatId — $err")
+                    }
+                } catch (e: Exception) {
+                    Log.e("ECGGuard-OpenWA", "BG service failed to send to $chatId: ${e.message}", e)
+                } finally {
+                    connection?.disconnect()
+                }
+            }
+        }
     }
 
     companion object {
